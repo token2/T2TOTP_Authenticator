@@ -70,7 +70,10 @@ The profile enabled for Auto-OTP is flagged with an **Auto-OTP** badge (the
 `[A]` tag on its issuer). From the header you can pick the transport, add a
 profile, refresh, open Settings, and Exit.
 
-*(Screenshots to be added.)*
+<img width="555" height="575" alt="image" src="https://github.com/user-attachments/assets/206c6892-b623-4b2b-8969-d67d7132d2ca" />
+
+<img width="555" height="589" alt="image" src="https://github.com/user-attachments/assets/a4ebd180-e899-45b6-b735-9d5da6b5c9af" />
+
 
 ## Download & run
 
