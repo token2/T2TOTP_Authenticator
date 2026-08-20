@@ -39,6 +39,10 @@ aes = { version = "0.8", default-features = false }
 cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
 sha2 = { version = "0.10", default-features = false }
+# HMAC-SHA256 for the OTP-PIN authenticated-session key ladder and auth tags.
+hmac = { version = "0.12", default-features = false }
+# Masked PIN entry on the terminal (cross-platform, incl. Windows console).
+rpassword = "7"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Scrub seeds/PINs from memory.

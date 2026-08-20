@@ -1,0 +1,2697 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fed3ce1..0cef3eb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2140,6 +2140,17 @@ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+ 
++[[package]]
++name = "rpassword"
++version = "7.5.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
++dependencies = [
++ "libc",
++ "rtoolbox",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "rqrr"
+ version = "0.7.1"
+@@ -2151,6 +2162,16 @@ dependencies = [
+  "lru",
+ ]
+ 
++[[package]]
++name = "rtoolbox"
++version = "0.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
++dependencies = [
++ "libc",
++ "windows-sys 0.59.0",
++]
++
+ [[package]]
+ name = "rustc-hash"
+ version = "1.1.0"
+@@ -2454,10 +2475,12 @@ dependencies = [
+  "enigo",
+  "global-hotkey",
+  "hidapi",
++ "hmac",
+  "image 0.25.5",
+  "p256",
+  "pcsc",
+  "rand_core",
++ "rpassword",
+  "rqrr",
+  "screenshots",
+  "sha2",
+diff --git a/Cargo.toml b/Cargo.toml
+index 65b46dc..061dfca 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,6 +39,10 @@ aes = { version = "0.8", default-features = false }
+ cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"] }
+ p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+ sha2 = { version = "0.10", default-features = false }
++# HMAC-SHA256 for the OTP-PIN authenticated-session key ladder and auth tags.
++hmac = { version = "0.12", default-features = false }
++# Masked PIN entry on the terminal (cross-platform, incl. Windows console).
++rpassword = "7"
+ rand_core = { version = "0.6", features = ["getrandom"] }
+ 
+ # Scrub seeds/PINs from memory.
+diff --git a/README.md b/README.md
+index 7629d8c..d282699 100644
+--- a/README.md
++++ b/README.md
+@@ -229,6 +229,7 @@ USAGE:
+ GLOBAL OPTS:
+     --transport <auto|hid|nfc>   Interface to use (default: auto)
+     --reader <name>              Pin a specific PC/SC reader (serial-confirmed)
++    --pin                        Verify the OTP PIN first (read from $T2TOTP_PIN/stdin)
+     --debug                      Trace device I/O on stderr
+ 
+ COMMANDS:
+@@ -244,6 +245,10 @@ COMMANDS:
+                                    --touch           require a button press to emit the code
+     delete <issuer> <account>    Delete a profile
+     erase --yes                  Erase ALL profiles on the key
++    pin status                   Show OTP-PIN state (set?, retries left)
++    pin set                      Set an OTP PIN (privacy protection)
++    pin change                   Change the OTP PIN
++    pin remove                   Remove the OTP PIN
+ ```
+ 
+ **The secret is never passed on the command line.** `add` reads the Base32
+@@ -280,6 +285,68 @@ t2totp delete O365 alice@example.com
+ t2totp erase --yes
+ ```
+ 
++### OTP PIN (privacy protection)
++
++Keys on **R3.4** firmware (manual V1.2) support an *OTP PIN* that gates read
++access to stored codes. Once a PIN is set, the key returns encrypted
++enumeration data, and a tool must run an authenticated ECDH session and verify
++the PIN to open a short read window before it can show codes.
++
++```sh
++# Check whether a PIN is set (and how many retries remain)
++t2totp pin status
++
++# Set / change / remove the PIN (prompted; or via $T2TOTP_PIN)
++t2totp pin set
++t2totp pin change
++t2totp pin remove
++
++# On a PIN-protected key, add --pin so list/code can return codes
++t2totp --pin list
++t2totp --pin code O365 alice@example.com
++```
++
++Like the TOTP secret, **the PIN is never passed on the command line** — it is
++read from **stdin** or the **`T2TOTP_PIN`** environment variable. The
++client-side policy check mirrors the firmware's rules (numeric ≥ 6 digits with
++no trivial sequences/repeats; alphanumeric ≥ 10 chars mixing at least two
++character classes).
++
++The OTP-PIN commands (`status` / `set` / `verify` / `change` / `remove`) are
++confirmed working against R3.4 firmware, over CCID/PC-SC, with the session
++crypto matching the Token2 reference client (`token2-otp-cli`).
++
++> ⚠️ **Security note.** The device also returns a P-521 signature over the
++> session handshake that a host *should* verify to authenticate the key. This
++> client establishes the encrypted ECDH session but does **not** verify that
++> signature (the bundled P-256 stack can't check a P-521 signature), so device
++> *authenticity* is not cryptographically checked — keep that in mind on an
++> untrusted reader.
++>
++> There is no PIN-only reset: if you forget the PIN, `t2totp erase --yes` wipes
++> all OTP entries and clears the PIN.
++
++In the **desktop GUI** (`t2totp-gui`), a PIN-protected key prompts for its PIN
++before listing codes; PIN set / change / remove live under **Settings → Manage
++OTP PIN**.
++
++Adding or deleting entries on a PIN-protected key works too. The client verifies
++the PIN first (opening the write window), then writes the seed using the verified
++PIN session keys rather than an ECDH blob: on a protected key `GET_ECDH_PUBKEY` is
++rejected, so the write is sealed in the same authenticated session format as
++PIN-mode reads reversed — `IV || AES-CBC(SessionEncKey, IV, entry) ||
++HMAC(SessionMacKey, EncData)`. Pass `--pin` to `add`/`delete` on the CLI; the GUI
++uses the PIN you unlocked with.
++
++The device closes the read/write window automatically after ~5 minutes. `t2totp
++pin lock` closes it immediately. In the GUI, a lock button (🔒) appears in the
++toolbar whenever a protected key is unlocked; clicking it closes the window and
++hides the codes. **Settings → Manage OTP PIN** also offers "Keep unlocked until I
++lock or unplug" — while on, the app re-verifies with the PIN you entered before
++each timeout, so the window stays open until you lock it (toolbar 🔒 or "Lock
++now") or remove the key. The PIN is held in memory only, for that session, and the
++code list is hidden whenever the key is locked.
++
+ ### Provisioning test profiles
+ 
+ Helper scripts add a handful of sample profiles for testing — including one
+diff --git a/src/bin/gui.rs b/src/bin/gui.rs
+index 1a9a6e5..0a5251a 100644
+--- a/src/bin/gui.rs
++++ b/src/bin/gui.rs
+@@ -24,7 +24,7 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke};
+ use t2totp::entry::{Algorithm, OtpType, WriteEntry};
+ use t2totp::transport::{Interface, OtpSession};
+ use t2totp::AUTO_TAG;
+-use zeroize::Zeroize;
++use zeroize::{Zeroize, Zeroizing};
+ 
+ #[cfg(feature = "hotkey")]
+ #[path = "../gui/hotkey.rs"]
+@@ -127,6 +127,14 @@ enum JobResult {
+     },
+     /// A quiet background refresh found the key gone; clear the list.
+     Disconnected,
++    /// Load/refresh hit a PIN-protected key with no (or wrong) PIN supplied.
++    /// The UI opens the PIN prompt in response. `wrong` distinguishes a bad
++    /// PIN retry from the first prompt.
++    PinRequired { wrong: bool },
++    /// PIN status read (whether set + retries remaining).
++    PinStatus { set: bool, retries: u8, max: u8 },
++    /// A keep-unlocked keep-alive re-verify succeeded (no UI change needed).
++    PinKeptAlive,
+     TouchCode {
+         key: (String, String),
+         code: String,
+@@ -179,7 +187,7 @@ fn algo_str(a: Algorithm) -> &'static str {
+ }
+ 
+ /// Load every entry + serial. Runs on the worker thread.
+-fn job_load(t: Transport) -> JobResult {
++fn job_load(t: Transport, pin: Option<Zeroizing<String>>) -> JobResult {
+     let mut session = match open(t) {
+         Ok(s) => s,
+         Err(e) => return JobResult::Err(e),
+@@ -189,7 +197,7 @@ fn job_load(t: Transport) -> JobResult {
+         .cached_serial()
+         .map(|s| t2totp::proto::hex(s))
+         .or_else(|| session.read_serial().ok().map(|s| t2totp::proto::hex(&s)));
+-    match session.enumerate(now_secs()) {
++    match session.enumerate_pinned(now_secs(), pin.as_deref().map(|z| z.as_str())) {
+         Ok(entries) => {
+             let rows = entries
+                 .into_iter()
+@@ -209,6 +217,10 @@ fn job_load(t: Transport) -> JobResult {
+                 transport: if is_pcsc { "NFC / PC-SC" } else { "USB-HID" },
+             }
+         }
++        Err(t2totp::transport::Error::PinRequired) => JobResult::PinRequired { wrong: false },
++        Err(t2totp::transport::Error::Applet(t2totp::proto::OtpError::PinNotVerified)) => {
++            JobResult::PinRequired { wrong: true }
++        }
+         Err(e) => JobResult::Err(e.to_string()),
+     }
+ }
+@@ -216,7 +228,7 @@ fn job_load(t: Transport) -> JobResult {
+ /// Quiet background refresh: re-read entries to update codes and detect unplug.
+ /// Returns `Disconnected` when the key is no longer reachable, so the UI can
+ /// clear stale codes instead of showing codes for an absent device.
+-fn job_refresh(t: Transport) -> JobResult {
++fn job_refresh(t: Transport, pin: Option<Zeroizing<String>>) -> JobResult {
+     let mut session = match open(t) {
+         Ok(s) => s,
+         // Any failure to open the session is treated as "device gone" for the
+@@ -228,7 +240,7 @@ fn job_refresh(t: Transport) -> JobResult {
+         .cached_serial()
+         .map(|s| t2totp::proto::hex(s))
+         .or_else(|| session.read_serial().ok().map(|s| t2totp::proto::hex(&s)));
+-    match session.enumerate(now_secs()) {
++    match session.enumerate_pinned(now_secs(), pin.as_deref().map(|z| z.as_str())) {
+         Ok(entries) => {
+             let rows = entries
+                 .into_iter()
+@@ -253,6 +265,83 @@ fn job_refresh(t: Transport) -> JobResult {
+     }
+ }
+ 
++fn job_pin_status(t: Transport) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(e) => return JobResult::Err(e),
++    };
++    match s.pin_status() {
++        Ok(f) => JobResult::PinStatus {
++            set: f.is_set(),
++            retries: f.retries_left,
++            max: f.max_retries,
++        },
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
++fn job_pin_set(t: Transport, pin: Zeroizing<String>) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(e) => return JobResult::Err(e),
++    };
++    match s.set_pin(&pin) {
++        Ok(()) => JobResult::Ok("OTP PIN set.".into()),
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
++fn job_pin_change(t: Transport, cur: Zeroizing<String>, new: Zeroizing<String>) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(e) => return JobResult::Err(e),
++    };
++    match s.change_pin(&cur, &new) {
++        Ok(()) => JobResult::Ok("OTP PIN changed.".into()),
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
++fn job_pin_remove(t: Transport, cur: Zeroizing<String>) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(e) => return JobResult::Err(e),
++    };
++    match s.remove_pin(&cur) {
++        Ok(()) => JobResult::Ok("OTP PIN removed.".into()),
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
++fn job_pin_lock(t: Transport) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(e) => return JobResult::Err(e),
++    };
++    match s.lock_pin() {
++        Ok(()) => JobResult::Ok("OTP PIN window locked.".into()),
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
++/// Keep-unlocked keep-alive: re-verify with the cached PIN to refresh the window
++/// before the device's ~5-minute timeout. Quiet — reports Refreshed-style status
++/// only via PinRequired on failure (so the UI can re-prompt).
++fn job_pin_keepalive(t: Transport, pin: Zeroizing<String>) -> JobResult {
++    let mut s = match open(t) {
++        Ok(s) => s,
++        Err(_) => return JobResult::Disconnected,
++    };
++    match s.reverify_pin(&pin) {
++        Ok(()) => JobResult::PinKeptAlive,
++        Err(t2totp::transport::Error::Applet(t2totp::proto::OtpError::PinNotVerified)) => {
++            JobResult::PinRequired { wrong: true }
++        }
++        Err(t2totp::transport::Error::PinNotSet) => JobResult::PinKeptAlive,
++        Err(e) => JobResult::Err(e.to_string()),
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // App state
+ // ---------------------------------------------------------------------------
+@@ -300,6 +389,40 @@ impl Drop for AddForm {
+     }
+ }
+ 
++/// State for the PIN prompt (verify to unlock reads) and the PIN-management
++/// section in Settings.
++#[derive(Default)]
++struct PinUi {
++    /// The unlock prompt is open (key is PIN-protected and not yet verified).
++    prompt_open: bool,
++    /// Text in the unlock prompt.
++    entry: String,
++    /// The last unlock attempt was rejected.
++    wrong: bool,
++    /// Whether the key currently has a PIN (from a status read); None = unknown.
++    is_set: Option<bool>,
++    retries: u8,
++    max: u8,
++    // --- management (Settings) fields ---
++    mgmt_open: bool,
++    set_new: String,
++    set_confirm: String,
++    change_cur: String,
++    change_new: String,
++    remove_cur: String,
++}
++
++impl Drop for PinUi {
++    fn drop(&mut self) {
++        self.entry.zeroize();
++        self.set_new.zeroize();
++        self.set_confirm.zeroize();
++        self.change_cur.zeroize();
++        self.change_new.zeroize();
++        self.remove_cur.zeroize();
++    }
++}
++
+ struct App {
+     p: Palette,
+     /// The app icon as an egui texture for the header badge (loaded once).
+@@ -329,6 +452,15 @@ struct App {
+     settings_open: bool,
+     touch_codes: std::collections::HashMap<(String, String), String>,
+     clipboard_clear_at: Option<(String, f64)>,
++    /// A verified OTP PIN, kept for the session so background refreshes can
++    /// re-open the read window. Cleared when the key is unplugged or on exit.
++    pin: Option<Zeroizing<String>>,
++    pin_ui: PinUi,
++    /// When true, keep the PIN window open all session by re-verifying with the
++    /// cached PIN before the device's ~5-minute timeout. Persisted.
++    keep_unlocked: bool,
++    /// Epoch seconds for the next keep-unlocked re-verify (0 = none scheduled).
++    next_pin_refresh_at: f64,
+     // job plumbing
+     tx: Sender<JobResult>,
+     rx: Receiver<JobResult>,
+@@ -382,6 +514,10 @@ impl App {
+             settings_open: false,
+             touch_codes: std::collections::HashMap::new(),
+             clipboard_clear_at: None,
++            pin: None,
++            pin_ui: PinUi::default(),
++            keep_unlocked: saved.keep_unlocked,
++            next_pin_refresh_at: 0.0,
+             tx,
+             rx,
+             clipboard,
+@@ -432,7 +568,8 @@ impl App {
+         self.loaded = false;
+         self.touch_codes.clear();
+         let t = self.transport;
+-        self.spawn("Reading entries…", None, move || job_load(t));
++        let pin = self.pin.clone();
++        self.spawn("Reading entries…", None, move || job_load(t, pin));
+     }
+ 
+     /// Schedule the next automatic refresh. We refresh shortly after the
+@@ -459,6 +596,50 @@ impl App {
+         self.next_refresh_at = now + interval;
+     }
+ 
++    /// Lock the PIN window now: drop the cached PIN, cancel the keep-alive, and
++    /// close the window on the device. After this the entry list is hidden until
++    /// the user unlocks again. Shared by the toolbar Lock button and the "Lock
++    /// now" control in Manage OTP PIN.
++    fn lock_now(&mut self, ctx: &egui::Context) {
++        if let Some(mut pp) = self.pin.take() {
++            pp.zeroize();
++        }
++        self.next_pin_refresh_at = 0.0;
++        // Hide entries immediately; the reload after locking will re-fetch and
++        // land back on the PIN prompt.
++        self.rows.clear();
++        let t = self.transport;
++        self.spawn_pin("Locking…", ctx, move || job_pin_lock(t));
++    }
++
++    /// Schedule the next keep-unlocked re-verify (~4 min; the device window is
++    /// ~5 min, so this refreshes comfortably before it closes).
++    fn schedule_next_pin_refresh(&mut self) {
++        if self.keep_unlocked && self.pin.is_some() {
++            self.next_pin_refresh_at = now_secs_f64() + 240.0;
++        } else {
++            self.next_pin_refresh_at = 0.0;
++        }
++    }
++
++    /// Fire a quiet keep-alive re-verify using the cached PIN.
++    fn pin_keepalive(&mut self, ctx: &egui::Context) {
++        let Some(pin) = self.pin.clone() else {
++            self.next_pin_refresh_at = 0.0;
++            return;
++        };
++        let t = self.transport;
++        let tx = self.tx.clone();
++        let ctx = ctx.clone();
++        // Reschedule immediately so we don't spam if the job is slow.
++        self.next_pin_refresh_at = now_secs_f64() + 240.0;
++        std::thread::spawn(move || {
++            let result = job_pin_keepalive(t, pin);
++            let _ = tx.send(result);
++            ctx.request_repaint();
++        });
++    }
++
+     /// Kick off a quiet background refresh (keeps showing current rows).
+     fn refresh_codes(&mut self, ctx: &egui::Context) {
+         if self.refreshing || !self.loaded {
+@@ -466,10 +647,11 @@ impl App {
+         }
+         self.refreshing = true;
+         let t = self.transport;
++        let pin = self.pin.clone();
+         let tx = self.tx.clone();
+         let ctx = ctx.clone();
+         std::thread::spawn(move || {
+-            let result = job_refresh(t);
++            let result = job_refresh(t, pin);
+             let _ = tx.send(result);
+             ctx.request_repaint();
+         });
+@@ -487,6 +669,7 @@ impl App {
+                 }
+                 .to_string(),
+             ),
++            keep_unlocked: self.keep_unlocked,
+             ..Default::default()
+         };
+         #[cfg(feature = "hotkey")]
+@@ -623,8 +806,13 @@ impl App {
+                     self.schedule_next_refresh();
+                 }
+                 JobResult::Disconnected => {
+-                    // Key removed (or unreadable): clear stale codes.
++                    // Key removed (or unreadable): clear stale codes and any
++                    // cached PIN / keep-alive (the window is gone with the key).
+                     self.refreshing = false;
++                    self.next_pin_refresh_at = 0.0;
++                    if let Some(mut pp) = self.pin.take() {
++                        pp.zeroize();
++                    }
+                     if !self.rows.is_empty() || self.serial.is_some() {
+                         self.rows.clear();
+                         self.serial = None;
+@@ -638,9 +826,39 @@ impl App {
+                     self.touch_codes.insert(key, code);
+                 }
+                 JobResult::Ok(msg) => {
+-                    self.set_info(msg);
++                    if !msg.is_empty() {
++                        self.set_info(msg);
++                    }
+                     self.reload();
+                 }
++                JobResult::PinRequired { wrong } => {
++                    // Key is PIN-protected and locked: stop the "reading" state,
++                    // hide any codes, and prompt to unlock.
++                    self.refreshing = false;
++                    self.loaded = true;
++                    self.next_pin_refresh_at = 0.0;
++                    self.rows.clear();
++                    self.touch_codes.clear();
++                    if wrong {
++                        // A stored PIN was rejected — drop it and re-prompt.
++                        if let Some(mut p) = self.pin.take() {
++                            p.zeroize();
++                        }
++                    }
++                    self.pin_ui.wrong = wrong;
++                    self.pin_ui.prompt_open = true;
++                    self.schedule_next_refresh();
++                }
++                JobResult::PinStatus { set, retries, max } => {
++                    self.pin_ui.is_set = Some(set);
++                    self.pin_ui.retries = retries;
++                    self.pin_ui.max = max;
++                    self.refreshing = false;
++                }
++                JobResult::PinKeptAlive => {
++                    // Window refreshed silently; schedule the next keep-alive.
++                    self.schedule_next_pin_refresh();
++                }
+                 JobResult::Err(msg) => {
+                     self.error = Some(msg);
+                     self.loaded = true;
+@@ -723,6 +941,16 @@ impl eframe::App for App {
+         {
+             self.refresh_codes(ctx);
+         }
++        // Keep-unlocked keep-alive: re-verify with the cached PIN before the
++        // device's ~5-minute window closes.
++        if self.keep_unlocked
++            && self.pin.is_some()
++            && self.busy.is_none()
++            && self.next_pin_refresh_at > 0.0
++            && now_secs_f64() >= self.next_pin_refresh_at
++        {
++            self.pin_keepalive(ctx);
++        }
+         #[cfg(feature = "hotkey")]
+         self.poll_hotkey();
+         apply_style(ctx, &self.p);
+@@ -754,6 +982,8 @@ impl eframe::App for App {
+         self.settings_dialog(ctx);
+         self.erase_dialog(ctx);
+         self.exit_dialog(ctx);
++        self.pin_dialog(ctx);
++        self.pin_mgmt_dialog(ctx);
+ 
+         // Keep TOTP countdowns ticking and clipboard-clear timely.
+         ctx.request_repaint_after(Duration::from_millis(250));
+@@ -835,6 +1065,18 @@ impl App {
+                     self.settings_open = true;
+                 }
+ 
++                // Lock button: only while a PIN-protected key is currently
++                // unlocked (a PIN is cached). Closes the window and hides codes.
++                if self.pin.is_some() {
++                    ui.add_space(6.0);
++                    if icon_button(ui, &self.p, "\u{1F512}")
++                        .on_hover_text("Lock OTP PIN (hide codes)")
++                        .clicked()
++                    {
++                        self.lock_now(ui.ctx());
++                    }
++                }
++
+                 // Small Auto-OTP toggle: icon only, accent when active. The full
+                 // combo lives in Settings and the bottom status bar.
+                 #[cfg(feature = "hotkey")]
+@@ -1039,12 +1281,23 @@ impl App {
+             let t = self.transport;
+             let (a, acct) = key.clone();
+             let ctx2 = ctx.clone();
++            let pin = self.pin.clone();
+             self.spawn("Touch your key to read the code…", Some(ctx.clone()), move || {
+                 let mut session = match open(t) {
+                     Ok(s) => s,
+                     Err(e) => return JobResult::Err(e),
+                 };
+                 let _ = &ctx2;
++                match session.unlock_if_pinned(pin.as_deref().map(|z| z.as_str())) {
++                    Ok(()) => {}
++                    Err(t2totp::transport::Error::PinRequired) => {
++                        return JobResult::PinRequired { wrong: false }
++                    }
++                    Err(t2totp::transport::Error::Applet(
++                        t2totp::proto::OtpError::PinNotVerified,
++                    )) => return JobResult::PinRequired { wrong: true },
++                    Err(e) => return JobResult::Err(e.to_string()),
++                }
+                 match session.read_entry(now_secs(), &a, &acct) {
+                     Ok(entry) => match entry.code {
+                         Some(code) => JobResult::TouchCode { key, code },
+@@ -1187,6 +1440,7 @@ impl App {
+         let t = self.transport;
+ 
+         self.add.open = false;
++        let pin = self.pin.clone();
+         self.spawn("Adding profile…", Some(ctx), move || {
+             let seed = match t2totp::proto::decode_base32_seed(&secret) {
+                 Ok(s) => s,
+@@ -1206,8 +1460,17 @@ impl App {
+                 account_name: &account,
+                 seed: &seed,
+             };
+-            match session.write_entry(&entry) {
++            // On a PIN-protected key, verify first: this opens the write window
++            // and captures the agreement pubkey the seal reuses (GET_ECDH_PUBKEY
++            // is blocked while a PIN is set).
++            match session.write_entry_pinned(&entry, pin.as_deref().map(|z| z.as_str())) {
+                 Ok(()) => JobResult::Ok(format!("Added {issuer}:{account}")),
++                Err(t2totp::transport::Error::PinRequired) => {
++                    JobResult::PinRequired { wrong: false }
++                }
++                Err(t2totp::transport::Error::Applet(
++                    t2totp::proto::OtpError::PinNotVerified,
++                )) => JobResult::PinRequired { wrong: true },
+                 Err(e) => JobResult::Err(e.to_string()),
+             }
+         });
+@@ -1247,13 +1510,27 @@ impl App {
+             Some(true) => {
+                 self.confirm_delete = None;
+                 let t = self.transport;
++                let pin = self.pin.clone();
+                 self.spawn("Deleting…", Some(ctx.clone()), move || {
+                     let mut session = match open(t) {
+                         Ok(s) => s,
+                         Err(e) => return JobResult::Err(e),
+                     };
+-                    match session.delete_entry(&app_name, &account) {
++                    // Delete is a seed-write; on a PIN-protected key verify first
++                    // (opens the window + captures the agreement pubkey the seal
++                    // reuses, since GET_ECDH_PUBKEY is blocked while a PIN is set).
++                    match session.delete_entry_pinned(
++                        &app_name,
++                        &account,
++                        pin.as_deref().map(|z| z.as_str()),
++                    ) {
+                         Ok(()) => JobResult::Ok("Deleted.".into()),
++                        Err(t2totp::transport::Error::PinRequired) => {
++                            JobResult::PinRequired { wrong: false }
++                        }
++                        Err(t2totp::transport::Error::Applet(
++                            t2totp::proto::OtpError::PinNotVerified,
++                        )) => JobResult::PinRequired { wrong: true },
+                         Err(e) => JobResult::Err(e.to_string()),
+                     }
+                 });
+@@ -1275,6 +1552,7 @@ impl App {
+         #[cfg(feature = "hotkey")]
+         let mut close_clicked = false;
+         let mut start_erase = false;
++        let mut open_pin_mgmt = false;
+ 
+         egui::Window::new("Settings")
+             .title_bar(false)
+@@ -1405,6 +1683,29 @@ impl App {
+                     ui.add_space(10.0);
+                 }
+ 
++                // OTP PIN (privacy protection).
++                ui.label(
++                    RichText::new("OTP PIN (privacy protection)")
++                        .font(prop(13.5))
++                        .strong(),
++                );
++                ui.add_space(2.0);
++                ui.label(
++                    RichText::new(
++                        "Require a PIN before OTP codes can be read from this key \
++                         (needs R3.4 firmware).",
++                    )
++                    .font(prop(11.0))
++                    .color(self.p.txt3),
++                );
++                ui.add_space(8.0);
++                if accent_button(ui, &self.p, "Manage OTP PIN…").clicked() {
++                    open_pin_mgmt = true;
++                }
++                ui.add_space(14.0);
++                ui.separator();
++                ui.add_space(10.0);
++
+                 // Danger zone.
+                 ui.label(RichText::new("Danger zone").font(prop(13.5)).strong().color(self.p.err));
+                 ui.add_space(2.0);
+@@ -1451,6 +1752,12 @@ impl App {
+             self.settings_open = false;
+             self.confirm_erase = true;
+         }
++        if open_pin_mgmt {
++            self.settings_open = false;
++            self.pin_ui.mgmt_open = true;
++            self.pin_ui.is_set = None;
++            self.refresh_pin_status(ctx);
++        }
+     }
+ 
+     fn exit_dialog(&mut self, ctx: &egui::Context) {
+@@ -1551,6 +1858,295 @@ impl App {
+             None => {}
+         }
+     }
++
++    /// Spawn a PIN-management job (status/set/change/remove) on the worker.
++    fn spawn_pin<F>(&mut self, busy: &str, ctx: &egui::Context, f: F)
++    where
++        F: FnOnce() -> JobResult + Send + 'static,
++    {
++        self.spawn(busy, Some(ctx.clone()), f);
++    }
++
++    /// Kick off a PIN status read (used to populate the management section).
++    fn refresh_pin_status(&mut self, ctx: &egui::Context) {
++        let t = self.transport;
++        self.spawn_pin("Reading PIN status…", ctx, move || job_pin_status(t));
++    }
++
++    /// The unlock prompt: shown when the key is PIN-protected and we don't yet
++    /// have a verified PIN. Entering the correct PIN reloads with reads unlocked.
++    fn pin_dialog(&mut self, ctx: &egui::Context) {
++        if !self.pin_ui.prompt_open {
++            return;
++        }
++        let mut submit = false;
++        let mut cancel = false;
++        let (keep_open, _) = modal(ctx, &self.p, "pin_dialog", "Enter OTP PIN", 340.0, |ui| {
++            ui.label(
++                RichText::new("This key is protected by an OTP PIN.")
++                    .font(prop(12.5))
++                    .color(self.p.txt),
++            );
++            ui.add_space(8.0);
++            let resp = ui.add(
++                egui::TextEdit::singleline(&mut self.pin_ui.entry)
++                    .password(true)
++                    .hint_text("OTP PIN")
++                    .desired_width(f32::INFINITY),
++            );
++            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
++                submit = true;
++            }
++            if self.pin_ui.wrong {
++                ui.add_space(4.0);
++                ui.label(
++                    RichText::new("Incorrect PIN — try again.")
++                        .font(prop(11.5))
++                        .color(self.p.err),
++                );
++            }
++            ui.add_space(14.0);
++            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                if accent_button(ui, &self.p, "Unlock").clicked() {
++                    submit = true;
++                }
++                ui.add_space(8.0);
++                if plain_button(ui, &self.p, "Cancel").clicked() {
++                    cancel = true;
++                }
++            });
++        });
++        if !keep_open {
++            cancel = true;
++        }
++        if submit && !self.pin_ui.entry.trim().is_empty() {
++            let pin = Zeroizing::new(self.pin_ui.entry.trim().to_string());
++            self.pin_ui.entry.zeroize();
++            self.pin_ui.entry.clear();
++            self.pin_ui.prompt_open = false;
++            self.pin_ui.wrong = false;
++            self.pin = Some(pin);
++            self.schedule_next_pin_refresh();
++            self.reload();
++        } else if cancel {
++            self.pin_ui.entry.zeroize();
++            self.pin_ui.entry.clear();
++            self.pin_ui.prompt_open = false;
++        }
++    }
++
++    /// PIN management modal: status + set / change / remove. Opened from Settings.
++    fn pin_mgmt_dialog(&mut self, ctx: &egui::Context) {
++        if !self.pin_ui.mgmt_open {
++            return;
++        }
++        let mut action: Option<PinAction> = None;
++        let mut close = false;
++        let mut lock_now = false;
++        let is_set = self.pin_ui.is_set;
++        let has_cached_pin = self.pin.is_some();
++        let mut keep_unlocked = self.keep_unlocked;
++        let (keep_open, _) =
++            modal(ctx, &self.p, "pin_mgmt_dialog", "OTP PIN (privacy protection)", 380.0, |ui| {
++                match is_set {
++                    Some(true) => {
++                        ui.label(
++                            RichText::new(format!(
++                                "PIN is set — {} of {} attempts remaining.",
++                                self.pin_ui.retries, self.pin_ui.max
++                            ))
++                            .font(prop(12.0))
++                            .color(self.p.txt),
++                        );
++                    }
++                    Some(false) => {
++                        ui.label(
++                            RichText::new("No PIN is set on this key.")
++                                .font(prop(12.0))
++                                .color(self.p.txt),
++                        );
++                    }
++                    None => {
++                        ui.label(
++                            RichText::new("Reading PIN status…")
++                                .font(prop(12.0))
++                                .color(self.p.txt3),
++                        );
++                    }
++                }
++                ui.add_space(10.0);
++
++                if is_set == Some(false) {
++                    ui.label(RichText::new("Set a PIN").font(prop(12.5)).strong());
++                    ui.add(
++                        egui::TextEdit::singleline(&mut self.pin_ui.set_new)
++                            .password(true)
++                            .hint_text("New PIN (≥6 digits, or ≥10 chars)")
++                            .desired_width(f32::INFINITY),
++                    );
++                    ui.add(
++                        egui::TextEdit::singleline(&mut self.pin_ui.set_confirm)
++                            .password(true)
++                            .hint_text("Confirm new PIN")
++                            .desired_width(f32::INFINITY),
++                    );
++                    ui.add_space(8.0);
++                    ui.horizontal(|ui| {
++                        if accent_button(ui, &self.p, "Set PIN").clicked() {
++                            action = Some(PinAction::Set);
++                        }
++                    });
++                }
++
++                if is_set == Some(true) {
++                    ui.label(RichText::new("Change PIN").font(prop(12.5)).strong());
++                    ui.add(
++                        egui::TextEdit::singleline(&mut self.pin_ui.change_cur)
++                            .password(true)
++                            .hint_text("Current PIN")
++                            .desired_width(f32::INFINITY),
++                    );
++                    ui.add(
++                        egui::TextEdit::singleline(&mut self.pin_ui.change_new)
++                            .password(true)
++                            .hint_text("New PIN")
++                            .desired_width(f32::INFINITY),
++                    );
++                    ui.add_space(6.0);
++                    ui.horizontal(|ui| {
++                        if accent_button(ui, &self.p, "Change PIN").clicked() {
++                            action = Some(PinAction::Change);
++                        }
++                    });
++                    ui.add_space(12.0);
++                    ui.separator();
++                    ui.add_space(6.0);
++                    ui.label(RichText::new("Remove PIN").font(prop(12.5)).strong());
++                    ui.add(
++                        egui::TextEdit::singleline(&mut self.pin_ui.remove_cur)
++                            .password(true)
++                            .hint_text("Current PIN")
++                            .desired_width(f32::INFINITY),
++                    );
++                    ui.add_space(6.0);
++                    ui.horizontal(|ui| {
++                        if danger_button(ui, &self.p, "Remove PIN").clicked() {
++                            action = Some(PinAction::Remove);
++                        }
++                    });
++                }
++
++                if is_set == Some(true) {
++                    ui.add_space(12.0);
++                    ui.separator();
++                    ui.add_space(6.0);
++                    ui.label(RichText::new("Session").font(prop(12.5)).strong());
++                    ui.add_space(2.0);
++                    ui.checkbox(
++                        &mut keep_unlocked,
++                        "Keep unlocked until I lock or unplug",
++                    );
++                    ui.label(
++                        RichText::new(
++                            "Re-verifies with the PIN you entered before the key's \
++                             ~5-minute window closes. The PIN is held in memory only \
++                             for this session.",
++                        )
++                        .font(prop(10.5))
++                        .color(self.p.txt3),
++                    );
++                    if has_cached_pin {
++                        ui.add_space(8.0);
++                        ui.horizontal(|ui| {
++                            if plain_button(ui, &self.p, "Lock now").clicked() {
++                                lock_now = true;
++                            }
++                        });
++                    }
++                }
++
++                ui.add_space(14.0);
++                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    if plain_button(ui, &self.p, "Close").clicked() {
++                        close = true;
++                    }
++                });
++            });
++        // Persist a keep-unlocked toggle change and (re)schedule the keep-alive.
++        if keep_unlocked != self.keep_unlocked {
++            self.keep_unlocked = keep_unlocked;
++            self.save_settings();
++            self.schedule_next_pin_refresh();
++        }
++        if lock_now {
++            self.lock_now(ctx);
++        }
++        if !keep_open {
++            close = true;
++        }
++        match action {
++            Some(PinAction::Set) => {
++                let new = self.pin_ui.set_new.trim().to_string();
++                let confirm = self.pin_ui.set_confirm.trim().to_string();
++                if new.is_empty() {
++                    self.error = Some("Enter a new PIN.".into());
++                } else if new != confirm {
++                    self.error = Some("PINs do not match.".into());
++                } else {
++                    let t = self.transport;
++                    let pin = Zeroizing::new(new);
++                    self.pin_ui.set_new.zeroize();
++                    self.pin_ui.set_confirm.zeroize();
++                    self.spawn_pin("Setting PIN…", ctx, move || job_pin_set(t, pin));
++                    self.pin_ui.is_set = None; // will re-read after
++                }
++            }
++            Some(PinAction::Change) => {
++                let cur = Zeroizing::new(self.pin_ui.change_cur.trim().to_string());
++                let new = Zeroizing::new(self.pin_ui.change_new.trim().to_string());
++                if cur.is_empty() || new.is_empty() {
++                    self.error = Some("Enter both the current and new PIN.".into());
++                } else {
++                    let t = self.transport;
++                    self.pin_ui.change_cur.zeroize();
++                    self.pin_ui.change_new.zeroize();
++                    self.spawn_pin("Changing PIN…", ctx, move || job_pin_change(t, cur, new));
++                    self.pin_ui.is_set = None;
++                }
++            }
++            Some(PinAction::Remove) => {
++                let cur = Zeroizing::new(self.pin_ui.remove_cur.trim().to_string());
++                if cur.is_empty() {
++                    self.error = Some("Enter the current PIN.".into());
++                } else {
++                    let t = self.transport;
++                    self.pin_ui.remove_cur.zeroize();
++                    // Removing the PIN also clears any cached verified PIN.
++                    if let Some(mut pp) = self.pin.take() {
++                        pp.zeroize();
++                    }
++                    self.spawn_pin("Removing PIN…", ctx, move || job_pin_remove(t, cur));
++                    self.pin_ui.is_set = None;
++                }
++            }
++            None => {}
++        }
++        if close {
++            self.pin_ui.mgmt_open = false;
++            self.pin_ui.set_new.zeroize();
++            self.pin_ui.set_confirm.zeroize();
++            self.pin_ui.change_cur.zeroize();
++            self.pin_ui.change_new.zeroize();
++            self.pin_ui.remove_cur.zeroize();
++        }
++    }
++}
++
++/// Which PIN-management action a click requested.
++enum PinAction {
++    Set,
++    Change,
++    Remove,
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/crypto.rs b/src/crypto.rs
+index 6f3d38c..f63896a 100644
+--- a/src/crypto.rs
++++ b/src/crypto.rs
+@@ -15,7 +15,8 @@
+ #![allow(dead_code)] // bundled library-style modules expose a fuller API than the CLI uses
+ 
+ use aes::Aes256;
+-use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
++use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
++use hmac::{Hmac, Mac};
+ use p256::ecdh::diffie_hellman;
+ use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+ use p256::{EncodedPoint, PublicKey, SecretKey};
+@@ -24,6 +25,8 @@ use sha2::{Digest, Sha256};
+ use zeroize::Zeroizing;
+ 
+ type Aes256CbcEnc = cbc::Encryptor<Aes256>;
++type Aes256CbcDec = cbc::Decryptor<Aes256>;
++type HmacSha256 = Hmac<Sha256>;
+ 
+ /// IV used when writing or deleting OTP entries (`WRITE_SEED`).
+ pub const IV_OTP: [u8; 16] = [
+@@ -35,6 +38,10 @@ pub const IV_OTP: [u8; 16] = [
+ pub enum EncryptError {
+     /// The device pubkey was not a valid 64-byte (`X || Y`) P-256 point.
+     BadDevicePubkey,
++    /// A session ciphertext did not decrypt / unpad cleanly.
++    BadCiphertext,
++    /// A session HMAC auth tag did not match.
++    BadAuthTag,
+ }
+ 
+ impl std::fmt::Display for EncryptError {
+@@ -43,6 +50,8 @@ impl std::fmt::Display for EncryptError {
+             EncryptError::BadDevicePubkey => {
+                 write!(f, "device ECDH public key was not a valid P-256 point")
+             }
++            EncryptError::BadCiphertext => write!(f, "session ciphertext failed to decrypt"),
++            EncryptError::BadAuthTag => write!(f, "session HMAC authentication tag mismatch"),
+         }
+     }
+ }
+@@ -97,10 +106,341 @@ pub fn encrypt_seed_payload(
+     Ok(blob)
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Authenticated ECDH session for the OTP-PIN commands (protocol doc §6.11)
++// ---------------------------------------------------------------------------
++
++/// The two 32-byte session keys derived from a `READ_AGREEMENT_PUBKEY` exchange.
++///
++/// Derivation (all HMAC-SHA256), per the protocol document:
++/// ```text
++/// shared        = ECDH-P256(hostPriv, devPub).X          (32 bytes)
++/// pu1PRKey      = HMAC(key = 0x00*32, data = shared)
++/// SessionMacKey = HMAC(key = pu1PRKey, data = "TOTP HMAC key" || 0x01)
++/// SessionEncKey = HMAC(key = pu1PRKey, data = "TOTP AES key"  || 0x01)
++/// ```
++pub struct SessionKeys {
++    pub enc: Zeroizing<[u8; 32]>,
++    pub mac: Zeroizing<[u8; 32]>,
++}
++
++fn hmac256(key: &[u8], data: &[u8]) -> [u8; 32] {
++    let mut m = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
++    m.update(data);
++    m.finalize().into_bytes().into()
++}
++
++/// Derive the session keys from an existing host secret and the device's
++/// 64-byte agreement pubkey (`X || Y`, no leading `0x04`).
++pub fn derive_session_keys(
++    host_secret: &SecretKey,
++    device_agreement_xy: &[u8],
++) -> Result<SessionKeys, EncryptError> {
++    if device_agreement_xy.len() != 64 {
++        return Err(EncryptError::BadDevicePubkey);
++    }
++    let mut sec1 = [0u8; 65];
++    sec1[0] = 0x04;
++    sec1[1..].copy_from_slice(device_agreement_xy);
++    let dev_point = EncodedPoint::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
++    let dev_pub = Option::<PublicKey>::from(PublicKey::from_encoded_point(&dev_point))
++        .ok_or(EncryptError::BadDevicePubkey)?;
++
++    let shared = diffie_hellman(host_secret.to_nonzero_scalar(), dev_pub.as_affine());
++    let pu1_pr = Zeroizing::new(hmac256(&[0u8; 32], shared.raw_secret_bytes()));
++    // Session-key ladder per the Token2 reference client (token2-otp-cli):
++    //   pu1PRKey      = HMAC(0x00*32, sharedX)
++    //   SessionMacKey = HMAC(pu1PRKey, "TOTP HMAC key" || 0x01)
++    //   SessionEncKey = HMAC(pu1PRKey, "TOTP AES key"  || 0x01)
++    let mut mac_info = b"TOTP HMAC key".to_vec();
++    mac_info.push(0x01);
++    let mut enc_info = b"TOTP AES key".to_vec();
++    enc_info.push(0x01);
++    Ok(SessionKeys {
++        enc: Zeroizing::new(hmac256(pu1_pr.as_slice(), &enc_info)),
++        mac: Zeroizing::new(hmac256(pu1_pr.as_slice(), &mac_info)),
++    })
++}
++
++/// Generate a host ephemeral P-256 keypair and derive session keys against the
++/// device's 64-byte agreement pubkey. Returns the host public key as raw
++/// `X || Y` (to send in `READ_AGREEMENT_PUBKEY`) and the derived keys.
++///
++/// Convenience wrapper around [`derive_session_keys`] for callers that do not
++/// need to keep the secret around; `transport` uses the split form so the
++/// pubkey it sends matches the keys it derives.
++pub fn establish_session(
++    device_agreement_xy: &[u8],
++) -> Result<([u8; 64], SessionKeys), EncryptError> {
++    let host_secret = SecretKey::random(&mut OsRng);
++    let keys = derive_session_keys(&host_secret, device_agreement_xy)?;
++    let host_point = host_secret.public_key().to_encoded_point(false);
++    let mut host_xy = [0u8; 64];
++    host_xy.copy_from_slice(&host_point.as_bytes()[1..]);
++    Ok((host_xy, keys))
++}
++
++/// AES-256-CBC encrypt `cleartext` (PKCS#7) under the session key with an
++/// explicit `iv`.
++pub fn session_encrypt(key: &[u8; 32], iv: &[u8; 16], cleartext: &[u8]) -> Vec<u8> {
++    let mut work = Zeroizing::new(cleartext.to_vec());
++    let pad_room = 16 - (cleartext.len() % 16);
++    work.resize(cleartext.len() + pad_room, 0);
++    let ct_len = cleartext.len();
++    Aes256CbcEnc::new(key.into(), iv.into())
++        .encrypt_padded_mut::<Pkcs7>(&mut work, ct_len)
++        .expect("buffer sized for PKCS7 padding above")
++        .to_vec()
++}
++
++/// AES-256-CBC decrypt WITHOUT unpadding — for diagnostics only, so debug
++/// output can show the raw plaintext even when PKCS#7 would reject it.
++pub fn session_decrypt_raw(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Vec<u8> {
++    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
++        return Vec::new();
++    }
++    let mut buf = ciphertext.to_vec();
++    Aes256CbcDec::new(key.into(), iv.into())
++        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
++        .map(|s| s.to_vec())
++        .unwrap_or_default()
++}
++
++/// AES-256-CBC decrypt+unpad a session ciphertext under the session key.
++pub fn session_decrypt(
++    key: &[u8; 32],
++    iv: &[u8; 16],
++    ciphertext: &[u8],
++) -> Result<Zeroizing<Vec<u8>>, EncryptError> {
++    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
++        return Err(EncryptError::BadCiphertext);
++    }
++    let mut buf = Zeroizing::new(ciphertext.to_vec());
++    let plain = Aes256CbcDec::new(key.into(), iv.into())
++        .decrypt_padded_mut::<Pkcs7>(&mut buf)
++        .map_err(|_| EncryptError::BadCiphertext)?;
++    Ok(Zeroizing::new(plain.to_vec()))
++}
++
++/// The first 16 bytes of `HMAC(mac_key, data)` — the auth-tag form the PIN
++/// commands use (`NewPinAuth`, `EncDataAuth`).
++pub fn session_auth_tag(mac_key: &[u8; 32], data: &[u8]) -> [u8; 16] {
++    let full = hmac256(mac_key, data);
++    let mut tag = [0u8; 16];
++    tag.copy_from_slice(&full[..16]);
++    tag
++}
++
++/// Constant-time-ish check of a 16-byte session auth tag.
++pub fn verify_auth_tag(mac_key: &[u8; 32], data: &[u8], tag: &[u8]) -> Result<(), EncryptError> {
++    if tag.len() != 16 {
++        return Err(EncryptError::BadAuthTag);
++    }
++    let expect = session_auth_tag(mac_key, data);
++    let mut diff = 0u8;
++    for (a, b) in expect.iter().zip(tag.iter()) {
++        diff |= a ^ b;
++    }
++    if diff == 0 {
++        Ok(())
++    } else {
++        Err(EncryptError::BadAuthTag)
++    }
++}
++
++/// Build the `SET_OTP_PIN` data field: `IV || NewPinEnc || NewPinAuth`, where
++/// `NewPin = alg(0x07) || retry(0x64) || pinLen || pin`, PKCS#7-padded to 16.
++/// Build the data field for a **PIN-protected seed write** (`WRITE_SEED` while a
++/// PIN window is open). Unlike an unprotected write — which is an ECDH blob keyed
++/// by a fresh `GET_ECDH_PUBKEY` — a protected write reuses the verified PIN
++/// session keys, exactly like PIN-mode reads in reverse:
++///
++///   `IV(16) || AES-CBC(SessionEncKey, IV, cleartext) || HMAC(SessionMacKey, EncData)[:16]`
++///
++/// (`GET_ECDH_PUBKEY` is rejected with 6A81 on a protected key, so no ECDH blob
++/// is possible; this session-key format is what the Token2 companion app sends.)
++pub fn build_protected_write_data(keys: &SessionKeys, cleartext: &[u8]) -> Vec<u8> {
++    let iv = random_iv();
++    let enc = session_encrypt(&keys.enc, &iv, cleartext);
++    let auth = session_auth_tag(&keys.mac, &enc);
++    let mut out = Vec::with_capacity(16 + enc.len() + 16);
++    out.extend_from_slice(&iv);
++    out.extend_from_slice(&enc);
++    out.extend_from_slice(&auth);
++    out
++}
++
++pub fn build_set_pin_data(keys: &SessionKeys, pin: &[u8], retry: u8) -> Vec<u8> {
++    let iv = random_iv();
++    let mut newpin = Vec::with_capacity(3 + pin.len());
++    newpin.push(0x07); // AlgId = AES256
++    newpin.push(retry);
++    newpin.push(pin.len() as u8);
++    newpin.extend_from_slice(pin);
++    let enc = session_encrypt(&keys.enc, &iv, &newpin);
++    let auth = session_auth_tag(&keys.mac, &enc);
++    let mut out = Vec::with_capacity(16 + enc.len() + 16);
++    out.extend_from_slice(&iv);
++    out.extend_from_slice(&enc);
++    out.extend_from_slice(&auth);
++    out
++}
++
++/// Build the `VERIFY_OTP_PIN` data field, matching the Token2 reference client:
++///
++/// ```text
++/// PinHash      = SHA256(pin)                         # 32 bytes
++/// IV2          = SHA256(Rand)[0:16]
++/// PinHashEnc   = AES-256-CBC(key = PinHash, IV2, data = Rand)   # inner, keyed by PIN
++/// IV           = random(16)
++/// PinHashEnc2  = AES-256-CBC(SessionEncKey, IV, PinHashEnc)     # outer, session key
++/// data field   = IV || PinHashEnc2
++/// ```
++///
++/// `rand` is the 16-byte challenge recovered from the `Lc=0x29` flag read
++/// (`Rand = AES-256-CBC-dec(SessionEncKey, flag.IV, flag.EncRand)`).
++pub fn build_verify_pin_data(keys: &SessionKeys, pin: &[u8], rand: &[u8]) -> Vec<u8> {
++    // Inner layer: key = SHA256(pin) (32 bytes => AES-256), IV = SHA256(rand)[:16].
++    let pin_hash = sha256(pin);
++    let iv2_full = sha256(rand);
++    let mut iv2 = [0u8; 16];
++    iv2.copy_from_slice(&iv2_full[..16]);
++    // Encrypt exactly the 16-byte Rand (no padding: it is already one block).
++    let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand);
++
++    // Outer layer under the session key with a fresh IV.
++    let iv = random_iv();
++    let outer = aes256_cbc_encrypt_nopad(keys.enc.as_slice().try_into().unwrap(), &iv, &inner);
++
++    let mut out = Vec::with_capacity(16 + outer.len());
++    out.extend_from_slice(&iv);
++    out.extend_from_slice(&outer);
++    out
++}
++
++/// Build the `CHANGE_OTP_PIN` data field, matching the Token2 reference client:
++///
++/// ```text
++/// body           = 0x07 || max_retry || len(newPin) || newPin      # newPin empty => remove
++/// body           = PKCS#7 pad to 16
++/// IV             = random(16)
++/// NewPinEnc      = AES-256-CBC(SessionEncKey, IV, body)
++/// OldPinHash     = SHA256(oldPin)[0:16]
++/// OldPinHashEnc  = AES-256-CBC(SessionEncKey, IV, OldPinHash)       # SAME IV
++/// NewPinAuth     = HMAC(SessionMacKey, NewPinEnc || OldPinHashEnc)[0:16]
++/// data field     = IV || NewPinEnc || NewPinAuth || OldPinHashEnc
++/// ```
++pub fn build_change_pin_data(
++    keys: &SessionKeys,
++    new_pin: &[u8],
++    current_pin: &[u8],
++    _rand: &[u8],
++) -> Vec<u8> {
++    let enc_key: &[u8; 32] = keys.enc.as_slice().try_into().unwrap();
++    let mut body = Vec::with_capacity(3 + new_pin.len());
++    body.push(0x07);
++    body.push(0x64);
++    body.push(new_pin.len() as u8);
++    body.extend_from_slice(new_pin);
++    let body = pkcs7_pad16(&body);
++
++    let iv = random_iv();
++    let new_pin_enc = aes256_cbc_encrypt_nopad(enc_key, &iv, &body);
++
++    let old_hash_full = sha256(current_pin);
++    let old_pin_hash = &old_hash_full[..16]; // 16 bytes, one block
++    let old_pin_hash_enc = aes256_cbc_encrypt_nopad(enc_key, &iv, old_pin_hash);
++
++    let mut mac_input = Vec::with_capacity(new_pin_enc.len() + old_pin_hash_enc.len());
++    mac_input.extend_from_slice(&new_pin_enc);
++    mac_input.extend_from_slice(&old_pin_hash_enc);
++    let new_pin_auth = session_auth_tag(&keys.mac, &mac_input);
++
++    let mut out = Vec::new();
++    out.extend_from_slice(&iv);
++    out.extend_from_slice(&new_pin_enc);
++    out.extend_from_slice(&new_pin_auth);
++    out.extend_from_slice(&old_pin_hash_enc);
++    out
++}
++
++/// The `alg(0x07) || retry(0x64) || len || pin` block used inside PIN proofs.
++fn pin_block(pin: &[u8]) -> Vec<u8> {
++    let mut b = Vec::with_capacity(3 + pin.len());
++    b.push(0x07);
++    b.push(0x64);
++    b.push(pin.len() as u8);
++    b.extend_from_slice(pin);
++    b
++}
++
++/// SHA-256 convenience.
++fn sha256(data: &[u8]) -> [u8; 32] {
++    let mut h = Sha256::new();
++    h.update(data);
++    h.finalize().into()
++}
++
++/// AES-256-CBC encrypt data that is already a whole number of 16-byte blocks,
++/// with NO padding added. Panics if `data` is not block-aligned.
++fn aes256_cbc_encrypt_nopad(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
++    assert!(
++        !data.is_empty() && data.len() % 16 == 0,
++        "aes256_cbc_encrypt_nopad needs block-aligned input"
++    );
++    let mut buf = data.to_vec();
++    let n = buf.len();
++    // encrypt_padded_mut with NoPadding requires buf already block-aligned.
++    Aes256CbcEnc::new(key.into(), iv.into())
++        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, n)
++        .expect("block-aligned, NoPadding")
++        .to_vec()
++}
++
++/// PKCS#7 pad to a 16-byte boundary (always adds 1..=16 bytes).
++fn pkcs7_pad16(data: &[u8]) -> Vec<u8> {
++    let n = 16 - (data.len() % 16);
++    let mut out = data.to_vec();
++    out.extend(std::iter::repeat(n as u8).take(n));
++    out
++}
++
++fn random_iv() -> [u8; 16] {
++    use rand_core::RngCore;
++    let mut iv = [0u8; 16];
++    OsRng.fill_bytes(&mut iv);
++    iv
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn protected_write_is_session_format_and_roundtrips() {
++        // A protected write is IV || AES-CBC(enc, IV, pt) || HMAC(mac, EncData)[:16].
++        // Verify the layout and that the read-side decrypt recovers the cleartext.
++        let keys = SessionKeys {
++            enc: Zeroizing::new([7u8; 32]),
++            mac: Zeroizing::new([9u8; 32]),
++        };
++        let cleartext = b"01\xC1\x00\x1E\x06\x00\x04Test\x0Eme@example.com\x05Hello";
++        let blob = build_protected_write_data(&keys, cleartext);
++        // 16 (IV) + ciphertext (PKCS7, multiple of 16) + 16 (auth).
++        assert!(blob.len() >= 16 + 16 + 16);
++        assert_eq!((blob.len() - 32) % 16, 0);
++        let iv = &blob[..16];
++        let enc = &blob[16..blob.len() - 16];
++        let auth = &blob[blob.len() - 16..];
++        // Auth tag matches HMAC(mac, EncData)[:16].
++        assert_eq!(auth, &session_auth_tag(&keys.mac, enc)[..]);
++        // Read-side decrypt (session_decrypt) recovers the cleartext.
++        let iv16: [u8; 16] = iv.try_into().unwrap();
++        let pt = session_decrypt(&keys.enc, &iv16, enc).expect("decrypt");
++        assert_eq!(&pt[..], &cleartext[..]);
++    }
++
+     #[test]
+     fn rejects_wrong_length_pubkey() {
+         assert_eq!(
+@@ -142,4 +482,73 @@ mod tests {
+             .unwrap();
+         assert_eq!(plain, cleartext);
+     }
++
++    #[test]
++    fn verify_build_is_nested_and_block_aligned() {
++        // Deterministic check of the *inner* layer (the outer uses a random IV).
++        // inner = AES-256-CBC(SHA256(pin), SHA256(rand)[:16], rand), no padding.
++        let keys = SessionKeys {
++            enc: Zeroizing::new([9u8; 32]),
++            mac: Zeroizing::new([7u8; 32]),
++        };
++        let pin = b"1357924";
++        let rand = [0x42u8; 16];
++        let out = build_verify_pin_data(&keys, pin, &rand);
++        // data = IV(16) || outer(16); outer is one block since inner is one block.
++        assert_eq!(out.len(), 32);
++        // Recompute the inner independently and confirm the outer decrypts to it.
++        let pin_hash = sha256(pin);
++        let mut iv2 = [0u8; 16];
++        iv2.copy_from_slice(&sha256(&rand)[..16]);
++        let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, &rand);
++        let iv: [u8; 16] = out[..16].try_into().unwrap();
++        let outer = &out[16..];
++        // decrypt outer under session enc key with NoPadding
++        use cbc::cipher::{BlockDecryptMut, KeyIvInit};
++        let mut buf = outer.to_vec();
++        let dec = Aes256CbcDec::new((&[9u8;32]).into(), (&iv).into())
++            .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
++            .unwrap();
++        assert_eq!(dec, &inner[..]);
++    }
++
++    #[test]
++    fn session_keys_agree_between_host_and_device() {
++        // Device side: make a keypair, hand its xy to the host, host derives.
++        let device_secret = SecretKey::random(&mut OsRng);
++        let dev_xy = {
++            let pt = device_secret.public_key().to_encoded_point(false);
++            pt.as_bytes()[1..].to_vec()
++        };
++        let (host_xy, host_keys) = establish_session(&dev_xy).unwrap();
++
++        // Device re-derives from the host's public xy and its own secret.
++        let dev_keys = derive_session_keys(&device_secret, &host_xy).unwrap();
++        assert_eq!(host_keys.enc.as_slice(), dev_keys.enc.as_slice());
++        assert_eq!(host_keys.mac.as_slice(), dev_keys.mac.as_slice());
++    }
++
++    #[test]
++    fn session_encrypt_decrypt_roundtrip_and_auth() {
++        let device_secret = SecretKey::random(&mut OsRng);
++        let dev_xy = {
++            let pt = device_secret.public_key().to_encoded_point(false);
++            pt.as_bytes()[1..].to_vec()
++        };
++        let (_hx, keys) = establish_session(&dev_xy).unwrap();
++        let iv = [7u8; 16];
++        let msg = b"the quick brown fox";
++        let ct = session_encrypt(&keys.enc, &iv, msg);
++        let pt = session_decrypt(&keys.enc, &iv, &ct).unwrap();
++        assert_eq!(&pt[..], msg);
++
++        let tag = session_auth_tag(&keys.mac, &ct);
++        assert!(verify_auth_tag(&keys.mac, &ct, &tag).is_ok());
++        let mut bad = tag;
++        bad[0] ^= 0xFF;
++        assert_eq!(
++            verify_auth_tag(&keys.mac, &ct, &bad),
++            Err(EncryptError::BadAuthTag)
++        );
++    }
+ }
+diff --git a/src/gui/config.rs b/src/gui/config.rs
+index 6ff94fb..68b7a13 100644
+--- a/src/gui/config.rs
++++ b/src/gui/config.rs
+@@ -15,6 +15,9 @@ use std::path::PathBuf;
+ #[derive(Clone, Default)]
+ pub struct Persisted {
+     pub transport: Option<String>, // "auto" | "hid" | "nfc"
++    /// Keep the OTP-PIN read/write window open for the whole session by
++    /// re-verifying with the cached PIN before the device's ~5-minute timeout.
++    pub keep_unlocked: bool,
+     #[cfg(feature = "hotkey")]
+     pub hotkey_enabled: bool,
+     #[cfg(feature = "hotkey")]
+@@ -90,6 +93,10 @@ impl Persisted {
+         if let Some(t) = map.get("transport") {
+             out.transport = Some((*t).to_string());
+         }
++        out.keep_unlocked = map
++            .get("keep_unlocked")
++            .map(|v| *v == "true")
++            .unwrap_or(false);
+         #[cfg(feature = "hotkey")]
+         {
+             out.hotkey_enabled = b("hotkey_enabled");
+@@ -118,6 +125,7 @@ impl Persisted {
+         if let Some(t) = &self.transport {
+             s.push_str(&format!("transport = {t}\n"));
+         }
++        s.push_str(&format!("keep_unlocked = {}\n", self.keep_unlocked));
+         #[cfg(feature = "hotkey")]
+         {
+             s.push_str(&format!("hotkey_enabled = {}\n", self.hotkey_enabled));
+diff --git a/src/main.rs b/src/main.rs
+index fca0c4a..b0186bf 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ use t2totp::entry::{Algorithm, OtpType, WriteEntry};
+ use t2totp::transport::{Error as TError, Interface, OtpSession, PcScTransport};
+ use t2totp::{proto, AUTO_TAG};
+-use zeroize::Zeroizing;
++use zeroize::{Zeroize, Zeroizing};
+ 
+ fn main() -> ExitCode {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+@@ -68,6 +68,7 @@ USAGE:
+ GLOBAL OPTS:
+     --transport <auto|hid|nfc>   Interface to use (default: auto)
+     --reader <name>              Pin a specific PC/SC reader (serial-confirmed)
++    --pin                        Verify the OTP PIN first (read from $T2TOTP_PIN/stdin)
+     --debug                      Trace device I/O on stderr
+ 
+ COMMANDS:
+@@ -83,11 +84,20 @@ COMMANDS:
+                                    --touch           require a button press to emit the code
+     delete <issuer> <account>    Delete a profile
+     erase --yes                  Erase ALL profiles on the key
++    pin status                   Show OTP-PIN state (set?, retries left)
++    pin set                      Set an OTP PIN (privacy protection)
++    pin change                   Change the OTP PIN
++    pin remove                   Remove the OTP PIN
++    pin lock                     Close the PIN read/write window now
++                                   PINs are read from $T2TOTP_PIN or stdin, never argv
+ 
+ Notes:
+   * Token2 FIDO keys only; HOTP/other-vendor/programmable-token features are absent.
+   * The secret is read from stdin (or $T2TOTP_SECRET), never from the command line.
+-  * NFC/PC-SC keys are identified by reading their serial, not by reader name.";
++  * NFC/PC-SC keys are identified by reading their serial, not by reader name.
++  * OTP-PIN 'privacy protection' requires R3.4 firmware; on a protected key,
++    pass --pin to list/code so they can return codes. Device authenticity
++    (the P-521 agreement signature) is NOT verified by this client yet.";
+ 
+ enum Error {
+     Usage(String),
+@@ -106,11 +116,20 @@ struct Globals {
+     debug: bool,
+     /// Explicit PC/SC reader name (serial-confirmed) — overrides auto-detect.
+     reader: Option<String>,
++    /// When set, open + verify an OTP-PIN session before read commands so a
++    /// privacy-protected key returns codes. The value is read from
++    /// `$T2TOTP_PIN` / stdin, never argv — this flag is just a toggle.
++    verify_pin: bool,
++    /// True only if the user passed `--transport` explicitly. PIN operations
++    /// run over CCID/PC-SC on the key, so when the transport was left at its
++    /// default they force NFC rather than letting `auto` land on HID (whose
++    /// OTP applet answers PIN commands with 6A86 on these models).
++    iface_explicit: bool,
+ }
+ 
+ fn run(args: &[String]) -> Result<(), Error> {
+-    let (globals, rest) = parse_globals(args)?;
+-    let (cmd, cmd_args) = match rest.split_first() {
++    let (mut globals, rest) = parse_globals(args)?;
++    let (cmd, rest_args) = match rest.split_first() {
+         Some(x) => x,
+         None => {
+             println!("{BANNER}\n");
+@@ -118,6 +137,10 @@ fn run(args: &[String]) -> Result<(), Error> {
+             return Ok(());
+         }
+     };
++    // Global flags are also accepted *after* the command, so
++    // `t2totp pin set --transport nfc` works as well as the leading form.
++    let cmd_args_owned = merge_trailing_globals(&mut globals, rest_args)?;
++    let cmd_args: &[String] = &cmd_args_owned;
+ 
+     match cmd.as_str() {
+         "help" | "--help" | "-h" => {
+@@ -132,14 +155,17 @@ fn run(args: &[String]) -> Result<(), Error> {
+         "add" => cmd_add(&globals, cmd_args),
+         "delete" | "del" | "rm" => cmd_delete(&globals, cmd_args),
+         "erase" => cmd_erase(&globals, cmd_args),
++        "pin" => cmd_pin(&globals, cmd_args),
+         other => Err(Error::Usage(format!("unknown command: {other}"))),
+     }
+ }
+ 
+ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
+     let mut iface = Interface::Auto;
++    let mut iface_explicit = false;
+     let mut debug = false;
+     let mut reader: Option<String> = None;
++    let mut verify_pin = false;
+     let mut i = 0;
+     while i < args.len() {
+         match args[i].as_str() {
+@@ -157,6 +183,7 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
+                         )))
+                     }
+                 };
++                iface_explicit = true;
+                 i += 2;
+             }
+             "--reader" => {
+@@ -170,6 +197,10 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
+                 debug = true;
+                 i += 1;
+             }
++            "--pin" => {
++                verify_pin = true;
++                i += 1;
++            }
+             _ => break,
+         }
+     }
+@@ -178,11 +209,63 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
+             iface,
+             debug,
+             reader,
++            verify_pin,
++            iface_explicit,
+         },
+         &args[i..],
+     ))
+ }
+ 
++/// Pull any global flags that appear *after* the subcommand out of `args`,
++/// applying them to `g`, and return the remaining (non-global) arguments. This
++/// lets `--transport`, `--reader`, `--pin`, and `--debug` be written in either
++/// position.
++fn merge_trailing_globals(g: &mut Globals, args: &[String]) -> Result<Vec<String>, Error> {
++    let mut out = Vec::with_capacity(args.len());
++    let mut i = 0;
++    while i < args.len() {
++        match args[i].as_str() {
++            "--transport" => {
++                let v = args
++                    .get(i + 1)
++                    .ok_or_else(|| Error::Usage("--transport needs a value".into()))?;
++                g.iface = match v.as_str() {
++                    "auto" => Interface::Auto,
++                    "hid" | "usb" => Interface::Hid,
++                    "nfc" | "ccid" | "pcsc" => Interface::Nfc,
++                    other => {
++                        return Err(Error::Usage(format!(
++                            "--transport must be auto|hid|nfc, got {other}"
++                        )))
++                    }
++                };
++                g.iface_explicit = true;
++                i += 2;
++            }
++            "--reader" => {
++                let v = args
++                    .get(i + 1)
++                    .ok_or_else(|| Error::Usage("--reader needs a PC/SC reader name".into()))?;
++                g.reader = Some(v.clone());
++                i += 2;
++            }
++            "--pin" => {
++                g.verify_pin = true;
++                i += 1;
++            }
++            "--debug" => {
++                g.debug = true;
++                i += 1;
++            }
++            _ => {
++                out.push(args[i].clone());
++                i += 1;
++            }
++        }
++    }
++    Ok(out)
++}
++
+ fn now_secs() -> u64 {
+     SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+@@ -191,11 +274,20 @@ fn now_secs() -> u64 {
+ }
+ 
+ fn open(g: &Globals) -> Result<OtpSession, Error> {
+-    // An explicit reader name pins the NFC/PC-SC device (still serial-confirmed).
+-    if let Some(name) = &g.reader {
+-        return Ok(OtpSession::open_pcsc_reader(name, g.debug)?);
++    // When --pin is requested we need the CCID/PC-SC path (see open_for_pin);
++    // otherwise honour the requested/auto transport for ordinary read commands.
++    let mut s = if g.verify_pin {
++        open_for_pin(g)?
++    } else if let Some(name) = &g.reader {
++        OtpSession::open_pcsc_reader(name, g.debug)?
++    } else {
++        OtpSession::open(g.iface, g.debug)?
++    };
++    if g.verify_pin {
++        let pin = read_pin("OTP PIN")?;
++        s.verify_pin(&pin)?;
+     }
+-    Ok(OtpSession::open(g.iface, g.debug)?)
++    Ok(s)
+ }
+ 
+ // --- commands ---------------------------------------------------------------
+@@ -387,7 +479,15 @@ fn cmd_add(g: &Globals, args: &[String]) -> Result<(), Error> {
+     };
+ 
+     let mut s = open(g)?;
+-    s.write_entry(&we)?;
++    // On a PIN-protected key the write needs the PIN (opens the window and
++    // provides the agreement pubkey the seal reuses). If the user already passed
++    // --pin, open() verified it; otherwise prompt now when the key is protected.
++    let pin = if !g.verify_pin && s.pin_is_set().unwrap_or(false) {
++        Some(read_pin("OTP PIN")?)
++    } else {
++        None
++    };
++    s.write_entry_pinned(&we, pin.as_deref().map(|z| z.as_str()))?;
+     println!(
+         "added TOTP profile {}:{}{}",
+         issuer,
+@@ -400,7 +500,12 @@ fn cmd_add(g: &Globals, args: &[String]) -> Result<(), Error> {
+ fn cmd_delete(g: &Globals, args: &[String]) -> Result<(), Error> {
+     let (issuer, account) = two_args(args, "delete")?;
+     let mut s = open(g)?;
+-    s.delete_entry(issuer, account)?;
++    let pin = if !g.verify_pin && s.pin_is_set().unwrap_or(false) {
++        Some(read_pin("OTP PIN")?)
++    } else {
++        None
++    };
++    s.delete_entry_pinned(issuer, account, pin.as_deref().map(|z| z.as_str()))?;
+     println!("deleted profile {issuer}:{account}");
+     Ok(())
+ }
+@@ -422,8 +527,104 @@ fn cmd_erase(g: &Globals, args: &[String]) -> Result<(), Error> {
+     Ok(())
+ }
+ 
++/// OTP-PIN management: `pin status|set|change|remove`.
++fn cmd_pin(g: &Globals, args: &[String]) -> Result<(), Error> {
++    let (sub, _rest) = args
++        .split_first()
++        .ok_or_else(|| Error::Usage("pin needs a subcommand: status|set|change|remove".into()))?;
++    match sub.as_str() {
++        "status" => {
++            let mut s = open_no_verify(g)?;
++            let flag = s.pin_status()?;
++            if flag.is_set() {
++                println!("OTP PIN: set");
++                println!("  length      : {} byte(s)", flag.pin_len);
++                println!("  retries left : {}", flag.retries_left);
++                println!("  max retries  : {}", flag.max_retries);
++            } else {
++                println!("OTP PIN: not set");
++            }
++            Ok(())
++        }
++        "set" => {
++            let mut s = open_no_verify(g)?;
++            let pin = read_pin("new OTP PIN")?;
++            let confirm = read_pin("confirm OTP PIN")?;
++            if pin.as_str() != confirm.as_str() {
++                return Err(Error::Other("PINs did not match".into()));
++            }
++            s.set_pin(&pin)?;
++            println!("OTP PIN set");
++            Ok(())
++        }
++        "change" => {
++            let mut s = open_no_verify(g)?;
++            let current = read_pin("current OTP PIN")?;
++            let new = read_pin("new OTP PIN")?;
++            let confirm = read_pin("confirm new OTP PIN")?;
++            if new.as_str() != confirm.as_str() {
++                return Err(Error::Other("new PINs did not match".into()));
++            }
++            s.change_pin(&current, &new)?;
++            println!("OTP PIN changed");
++            Ok(())
++        }
++        "remove" => {
++            let mut s = open_no_verify(g)?;
++            let current = read_pin("current OTP PIN")?;
++            s.remove_pin(&current)?;
++            println!("OTP PIN removed");
++            Ok(())
++        }
++        "lock" => {
++            let mut s = open_no_verify(g)?;
++            s.lock_pin()?;
++            println!("OTP PIN window locked");
++            Ok(())
++        }
++        other => Err(Error::Usage(format!(
++            "unknown pin subcommand: {other} (use status|set|change|remove|lock)"
++        ))),
++    }
++}
++
++/// Open a session WITHOUT auto-verifying a PIN — the pin subcommands drive the
++/// session themselves (and set/verify must not double-prompt).
++fn open_no_verify(g: &Globals) -> Result<OtpSession, Error> {
++    let s = open_for_pin(g)?;
++    Ok(s)
++}
++
++/// Open a session for OTP-PIN work. PIN commands run over the CCID/PC-SC
++/// interface on the key (the same path the GUI uses); the HID OTP applet
++/// answers them with `6A86` on these models. So unless the user explicitly
++/// chose a transport, force NFC/PC-SC here, and refuse to proceed on a HID
++/// session with an actionable message.
++fn open_for_pin(g: &Globals) -> Result<OtpSession, Error> {
++    if let Some(name) = &g.reader {
++        return Ok(OtpSession::open_pcsc_reader(name, g.debug)?);
++    }
++    let iface = if g.iface_explicit {
++        g.iface
++    } else {
++        // Default (unspecified) transport -> use NFC/PC-SC for PIN ops.
++        Interface::Nfc
++    };
++    let s = OtpSession::open(iface, g.debug)?;
++    if !s.is_pcsc() {
++        return Err(Error::Other(
++            "OTP-PIN commands must run over CCID/PC-SC (a contact or NFC reader), \
++             but the key was opened over USB-HID. Re-run with `--transport nfc` \
++             and the key on a PC/SC reader (this is the same interface the GUI uses)."
++                .into(),
++        ));
++    }
++    Ok(s)
++}
++
+ // --- helpers ----------------------------------------------------------------
+ 
++
+ fn yes_no(b: bool) -> &'static str {
+     if b {
+         "yes"
+@@ -466,3 +667,40 @@ fn read_secret() -> Result<Zeroizing<String>, Error> {
+     }
+     Ok(Zeroizing::new(trimmed))
+ }
++
++/// Read an OTP PIN from `$T2TOTP_PIN` if set, else from the terminal with the
++/// input **masked** (no echo). Zeroizes on drop. `label` is the prompt shown.
++fn read_pin(label: &str) -> Result<Zeroizing<String>, Error> {
++    if let Some(val) = std::env::var_os("T2TOTP_PIN") {
++        let s = val
++            .into_string()
++            .map_err(|_| Error::Other("T2TOTP_PIN was not valid UTF-8".into()))?;
++        return Ok(Zeroizing::new(s.trim().to_string()));
++    }
++    let stdin = std::io::stdin();
++    if stdin.is_terminal() {
++        // Masked prompt: nothing is echoed as the PIN is typed. Works on the
++        // Windows console as well as Unix ttys.
++        let entered = rpassword::prompt_password(format!("{label}: "))
++            .map_err(|e| Error::Other(format!("failed to read PIN: {e}")))?;
++        let mut entered = Zeroizing::new(entered);
++        let trimmed = entered.trim().to_string();
++        entered.zeroize();
++        if trimmed.is_empty() {
++            return Err(Error::Other("no PIN provided".into()));
++        }
++        return Ok(Zeroizing::new(trimmed));
++    }
++    // Non-interactive (piped): take the whole stdin as the PIN.
++    let mut buf = Zeroizing::new(String::new());
++    std::io::stdin()
++        .read_to_string(&mut buf)
++        .map_err(|e| Error::Other(format!("failed to read PIN from stdin: {e}")))?;
++    let trimmed = buf.trim().to_string();
++    if trimmed.is_empty() {
++        return Err(Error::Other(
++            "no PIN provided (pipe it on stdin or set $T2TOTP_PIN)".into(),
++        ));
++    }
++    Ok(Zeroizing::new(trimmed))
++}
+diff --git a/src/proto.rs b/src/proto.rs
+index 6e049d5..8c58bef 100644
+--- a/src/proto.rs
++++ b/src/proto.rs
+@@ -48,6 +48,26 @@ pub mod cmd {
+     pub const SUB_READ_ONE: u8 = 0x01;
+     /// ENUM_CODES subcommand: paginated read-all.
+     pub const SUB_READ_ALL: u8 = 0x03;
++
++    // --- OTP PIN / privacy protection (R3.4 / manual V1.2) -------------------
++    /// `READ_OTP_PIN_FLAG` — device returns PIN status; Lc selects how much.
++    pub const READ_OTP_PIN_FLAG: [u8; 4] = [0x80, 0xC5, 0x05, 0x04];
++    /// `SET_OTP_PIN` — set a PIN from the unprotected state.
++    pub const SET_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x05];
++    /// `VERIFY_OTP_PIN` — open a read window.
++    pub const VERIFY_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x06];
++    /// `CHANGE_OTP_PIN` — change or remove an existing PIN.
++    pub const CHANGE_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x08];
++    /// `READ_AGREEMENT_PUBKEY` — establish the authenticated ECDH session.
++    pub const READ_AGREEMENT_PUBKEY: [u8; 4] = [0x80, 0xC5, 0x05, 0x09];
++
++    /// Lc for the short PIN-flag read: `PinAlgId,PinRetry,OtpPinLen,PinMaxRetry`.
++    pub const PIN_FLAG_LC_BASE: u8 = 0x04;
++    /// Lc for the PIN-flag read that also returns the verify challenge
++    /// (`... || IV(16) || EncRand(16)`).
++    pub const PIN_FLAG_LC_CHALLENGE: u8 = 0x29;
++    /// AES-256 PIN algorithm id used in the NewPin block.
++    pub const PIN_ALG_AES256: u8 = 0x07;
+ }
+ 
+ /// ISO-7816 status words this applet returns.
+@@ -58,6 +78,19 @@ pub mod sw {
+     pub const NOT_ENOUGH_SPACE: u16 = 0x6A84;
+     pub const HID_NOT_SUPPORTED: u16 = 0x6A86;
+     pub const BUTTON_TIMEOUT: u16 = 0x6FF9;
++    /// `6A81` — function not supported in the current state (e.g. SET_OTP_PIN
++    /// when a PIN already exists).
++    pub const NOT_ALLOWED: u16 = 0x6A81;
++    /// `6982` — security status not satisfied (PIN not verified / wrong PIN).
++    pub const SECURITY_NOT_SATISFIED: u16 = 0x6982;
++    /// `6983` — authentication method blocked (PIN locked out).
++    pub const PIN_BLOCKED: u16 = 0x6983;
++    /// `6A86` — incorrect P1/P2: on this applet it means the command is not
++    /// implemented by the firmware (the manual flags this as model-specific).
++    pub const WRONG_P1P2: u16 = 0x6A86;
++    /// `6AF8` — Token2-proprietary parameter/framing error (e.g. a case-2 read
++    /// whose length byte the applet misread as an Lc). NOT "unsupported".
++    pub const PROPRIETARY_PARAM_ERR: u16 = 0x6AF8;
+ }
+ 
+ /// An expected, surfaced-to-user applet error.
+@@ -71,6 +104,16 @@ pub enum OtpError {
+     ButtonPressRequired,
+     /// `6A86` — this model does not expose HOTP-over-HID.
+     HidNotSupported,
++    /// `6A81` — command not allowed in the current PIN state.
++    NotAllowedInState,
++    /// `6982` — PIN not verified, or the wrong PIN was supplied.
++    PinNotVerified,
++    /// `6983` — PIN is locked out after too many wrong attempts.
++    PinBlocked,
++    /// The OTP-PIN command set is not implemented by this key's firmware
++    /// (privacy protection needs R3.4 / manual V1.2). Seen as `6A86` / `6AF8`
++    /// on the PIN commands.
++    PinUnsupported(u16),
+     /// Any other non-`9000` status word.
+     BadStatusCode(u16),
+ }
+@@ -84,6 +127,27 @@ impl OtpError {
+             sw::NOT_ENOUGH_SPACE => Err(OtpError::NotEnoughSpace),
+             sw::BUTTON_TIMEOUT => Err(OtpError::ButtonPressRequired),
+             sw::HID_NOT_SUPPORTED => Err(OtpError::HidNotSupported),
++            sw::NOT_ALLOWED => Err(OtpError::NotAllowedInState),
++            sw::SECURITY_NOT_SATISFIED => Err(OtpError::PinNotVerified),
++            sw::PIN_BLOCKED => Err(OtpError::PinBlocked),
++            other => Err(OtpError::BadStatusCode(other)),
++        }
++    }
++
++        /// Map a status word for an OTP-PIN command, translating the
++    /// not-implemented codes (`6A86` / `6AF8`) into [`OtpError::PinUnsupported`]
++    /// so callers get an accurate message instead of the generic HID one.
++    pub fn check_pin(sw: u16) -> Result<(), OtpError> {
++        match sw {
++            sw::OK => Ok(()),
++            // 6A86 on the *session* command has been observed only on older
++            // keys that lack the feature entirely; on a PIN-capable key the
++            // handshake returns 9000. We surface it as "unsupported" but note
++            // the SW so it is never confused with a framing bug.
++            sw::WRONG_P1P2 => Err(OtpError::PinUnsupported(sw)),
++            sw::NOT_ALLOWED => Err(OtpError::NotAllowedInState),
++            sw::SECURITY_NOT_SATISFIED => Err(OtpError::PinNotVerified),
++            sw::PIN_BLOCKED => Err(OtpError::PinBlocked),
+             other => Err(OtpError::BadStatusCode(other)),
+         }
+     }
+@@ -103,6 +167,19 @@ impl std::fmt::Display for OtpError {
+                 write!(f, "timed out waiting for a button press on the key")
+             }
+             OtpError::HidNotSupported => write!(f, "HOTP-over-HID is not supported on this model"),
++            OtpError::NotAllowedInState => {
++                write!(f, "command not allowed in the current PIN state")
++            }
++            OtpError::PinNotVerified => write!(f, "OTP PIN not verified or incorrect"),
++            OtpError::PinBlocked => {
++                write!(f, "OTP PIN is locked out; erase-all is the only recovery")
++            }
++            OtpError::PinUnsupported(sw) => write!(
++                f,
++                "this key's firmware does not support the OTP PIN (privacy-protection) \
++                 feature — it needs R3.4 / OTP-manual V1.2 (device replied {:#06X})",
++                sw
++            ),
+             OtpError::BadStatusCode(sw) => write!(f, "unexpected status word {:#06X}", sw),
+         }
+     }
+@@ -180,6 +257,152 @@ pub fn serialize_enum_all(timestamp: u64) -> Vec<u8> {
+     buf
+ }
+ 
++// --- OTP PIN (privacy protection) --------------------------------------------
++
++/// Build a `READ_OTP_PIN_FLAG` request for the given short-form `Lc`. Use
++/// [`cmd::PIN_FLAG_LC_BASE`] for status only, or [`cmd::PIN_FLAG_LC_CHALLENGE`]
++/// to also fetch the `IV || EncRand` verify challenge.
++pub fn read_otp_pin_flag(len: u8) -> Vec<u8> {
++    // The flag read is a short-Lc command that carries a body: `CLA INS P1 P2
++    // len || len*0x00`. The applet reads `len` (04/09/29), overwrites the
++    // placeholder body, and returns `len` bytes of PIN-flag data (chaining via
++    // 61xx). A bodyless read in any form is rejected with the proprietary 6AF8;
++    // confirmed by device probing against R3.4 firmware.
++    let mut v = cmd::READ_OTP_PIN_FLAG.to_vec();
++    v.push(len);
++    v.extend(std::iter::repeat(0x00).take(len as usize));
++    v
++}
++
++/// Build the OTP-PIN **lock** request: it shares the `VERIFY_OTP_PIN` header
++/// (`80 C5 05 06`) but is distinguished from a verify by its body — a single
++/// `0x00` byte, sent with short-form Lc. The applet closes the read/write window
++/// immediately (the same window a verify opens for ~5 minutes). Matches the
++/// Token2 reference client's `lock()`.
++pub fn lock_otp_pin() -> Vec<u8> {
++    let mut v = cmd::VERIFY_OTP_PIN.to_vec();
++    v.push(0x01); // short Lc = 1
++    v.push(0x00); // body
++    v
++}
++
++/// Build the `READ_AGREEMENT_PUBKEY` request. `host_pub_xy` is the host's
++/// ephemeral P-256 public key as raw `X || Y` (64 bytes, no `0x04`).
++pub fn read_agreement_pubkey(host_pub_xy: &[u8]) -> Vec<u8> {
++    build_apdu(cmd::READ_AGREEMENT_PUBKEY, host_pub_xy)
++}
++
++/// Decoded fixed head of a `READ_OTP_PIN_FLAG` response.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PinFlag {
++    pub alg_id: u8,
++    pub retries_left: u8,
++    pub pin_len: u8,
++    pub max_retries: u8,
++    /// Present only on the `Lc = 0x29` read: the verify challenge
++    /// (`IV(16) || EncRand(16)`), still encrypted under the session key.
++    pub challenge: Option<([u8; 16], [u8; 16])>,
++}
++
++impl PinFlag {
++    /// A PIN is set iff the reported PIN length is non-zero.
++    pub fn is_set(&self) -> bool {
++        self.pin_len != 0
++    }
++
++    /// Parse the response. Layout matches the Token2 reference client:
++    /// `AlgId(1) Retry(1) PinLen(1) MaxRetry(1) FpEnable(1) PubVer(2) PubCrc(2)`
++    /// then, on the `Lc=0x29` read, `IV(16) EncRand(16)` starting at offset 9.
++    pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
++        if data.len() < 4 {
++            return Err(ParseError::Truncated);
++        }
++        let challenge = if data.len() >= 41 {
++            let mut iv = [0u8; 16];
++            let mut enc = [0u8; 16];
++            iv.copy_from_slice(&data[9..25]);
++            enc.copy_from_slice(&data[25..41]);
++            Some((iv, enc))
++        } else {
++            None
++        };
++        Ok(PinFlag {
++            alg_id: data[0],
++            retries_left: data[1],
++            pin_len: data[2],
++            max_retries: data[3],
++            challenge,
++        })
++    }
++}
++
++/// Enforce the client-side OTP-PIN policy (protocol doc §9). Mirrors the rules
++/// the firmware rejects with `6A80`, surfaced here as a clear message before we
++/// hit the wire. Returns the PIN's byte length on success.
++pub fn validate_otp_pin(pin: &str) -> Result<u8, &'static str> {
++    let bytes = pin.as_bytes();
++    if bytes.len() > 255 {
++        return Err("PIN is too long");
++    }
++    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
++    if all_digits {
++        validate_numeric_pin(bytes)?;
++    } else {
++        validate_alphanumeric_pin(pin)?;
++    }
++    Ok(bytes.len() as u8)
++}
++
++fn validate_numeric_pin(b: &[u8]) -> Result<(), &'static str> {
++    if b.len() < 6 {
++        return Err("numeric PIN must be at least 6 digits");
++    }
++    // all-identical
++    if b.iter().all(|&c| c == b[0]) {
++        return Err("numeric PIN must not be all the same digit");
++    }
++    // ascending / descending runs across the whole PIN
++    let asc = b.windows(2).all(|w| w[1] == w[0] + 1);
++    let desc = b.windows(2).all(|w| w[0] == w[1] + 1);
++    if asc || desc {
++        return Err("numeric PIN must not be a simple ascending/descending sequence");
++    }
++    // palindrome
++    if b.iter().eq(b.iter().rev()) {
++        return Err("numeric PIN must not be a palindrome");
++    }
++    // any single digit repeating more than 3 times total
++    for d in b'0'..=b'9' {
++        if b.iter().filter(|&&c| c == d).count() > 3 {
++            return Err("numeric PIN repeats a single digit too many times");
++        }
++    }
++    Ok(())
++}
++
++fn validate_alphanumeric_pin(pin: &str) -> Result<(), &'static str> {
++    if pin.chars().count() < 10 {
++        return Err("alphanumeric PIN must be at least 10 characters");
++    }
++    let mut classes = 0;
++    if pin.chars().any(|c| c.is_ascii_uppercase()) {
++        classes += 1;
++    }
++    if pin.chars().any(|c| c.is_ascii_lowercase()) {
++        classes += 1;
++    }
++    if pin.chars().any(|c| c.is_ascii_digit()) {
++        classes += 1;
++    }
++    if pin.chars().any(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace()) {
++        classes += 1;
++    }
++    if classes < 2 {
++        return Err("alphanumeric PIN must mix at least two of: upper, lower, digit, symbol");
++    }
++    Ok(())
++}
++
+ // --- serial parsing -----------------------------------------------------------
+ 
+ /// Parse the serial-number response: `D1 len ascii_hex...`. The serial is
+@@ -389,6 +612,12 @@ mod tests {
+         assert_eq!(erase_all(), vec![0x80, 0xC5, 0x05, 0x02]);
+     }
+ 
++    #[test]
++    fn lock_is_verify_header_with_zero_body() {
++        // Lock shares the VERIFY header (80 C5 05 06), short Lc=1, body 0x00.
++        assert_eq!(lock_otp_pin(), vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x00]);
++    }
++
+     #[test]
+     fn select_uses_short_lc() {
+         assert_eq!(
+@@ -405,6 +634,24 @@ mod tests {
+         assert!(OtpError::check(0x6A80).unwrap_err().is_empty_token());
+     }
+ 
++    #[test]
++    fn pin_status_words_map_to_unsupported() {
++        // On the PIN commands, 6A86 and 6AF8 mean "firmware lacks the feature".
++        assert_eq!(OtpError::check_pin(0x9000), Ok(()));
++        assert!(matches!(
++            OtpError::check_pin(0x6A86),
++            Err(OtpError::PinUnsupported(0x6A86))
++        ));
++        // 6AF8 is a parameter/framing error, not "unsupported".
++        assert!(matches!(
++            OtpError::check_pin(0x6AF8),
++            Err(OtpError::BadStatusCode(0x6AF8))
++        ));
++        assert_eq!(OtpError::check_pin(0x6982), Err(OtpError::PinNotVerified));
++        // But the *generic* check still treats 6A86 as the HID message.
++        assert_eq!(OtpError::check(0x6A86), Err(OtpError::HidNotSupported));
++    }
++
+     #[test]
+     fn serial_double_decode() {
+         let resp = [
+@@ -419,6 +666,58 @@ mod tests {
+         assert_eq!(&decode_base32_seed("jbswy3dp").unwrap()[..], b"Hello");
+     }
+ 
++    #[test]
++    fn pin_flag_parses_base_and_challenge() {
++        // base (Lc=04): alg, retries, len, max
++        let base = [0x07, 0x05, 0x06, 0x0A];
++        let f = PinFlag::parse(&base).unwrap();
++        assert!(f.is_set());
++        assert_eq!(f.pin_len, 6);
++        assert_eq!(f.retries_left, 5);
++        assert!(f.challenge.is_none());
++
++        // unset device
++        let unset = [0x00, 0x00, 0x00, 0x0A];
++        assert!(!PinFlag::parse(&unset).unwrap().is_set());
++
++        // challenge (Lc=0x29): base(4) + fp(1) + pubver(2) + pubcrc(2) + IV(16) + EncRand(16)
++        let mut chal = vec![0x07, 0x05, 0x06, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x22];
++        chal.extend_from_slice(&[0xAA; 16]);
++        chal.extend_from_slice(&[0xBB; 16]);
++        let f = PinFlag::parse(&chal).unwrap();
++        let (iv, enc) = f.challenge.unwrap();
++        assert_eq!(iv, [0xAA; 16]);
++        assert_eq!(enc, [0xBB; 16]);
++    }
++
++    #[test]
++    fn otp_pin_policy() {
++        // good numeric
++        assert!(validate_otp_pin("135790").is_ok());
++        // too short
++        assert!(validate_otp_pin("12345").is_err());
++        // ascending / all-same / palindrome / over-repeat
++        assert!(validate_otp_pin("123456").is_err());
++        assert!(validate_otp_pin("111111").is_err());
++        assert!(validate_otp_pin("321123").is_err());
++        assert!(validate_otp_pin("111123").is_err());
++        // alphanumeric: needs >=10 and two classes
++        assert!(validate_otp_pin("abcdefghij").is_err()); // one class
++        assert!(validate_otp_pin("Abcdefghi9").is_ok());
++        assert!(validate_otp_pin("short1A").is_err());
++    }
++
++    #[test]
++    fn pin_flag_apdu_forms() {
++        // Extended-length case-2: CLA INS P1 P2 00 00 Le.
++        assert_eq!(
++            read_otp_pin_flag(0x04),
++            vec![0x80, 0xC5, 0x05, 0x04, 0x04, 0, 0, 0, 0]
++        );
++        // short Lc + `len` body bytes => 5 header/Lc bytes + len body bytes
++        assert_eq!(read_otp_pin_flag(0x29).len(), 5 + 0x29);
++    }
++
+     #[test]
+     fn device_info_short_response() {
+         let info = DeviceInfo::parse(&[0x02]).unwrap();
+diff --git a/src/transport.rs b/src/transport.rs
+index 532c3e1..842e45e 100644
+--- a/src/transport.rs
++++ b/src/transport.rs
+@@ -20,7 +20,8 @@ use crate::entry::{
+ };
+ use crate::hidframe::{self, ResponseAssembler, Step};
+ use crate::proto::{
+-    self as t2, build_apdu, build_select, cmd, serialize_enum_all, DeviceInfo, OtpError, ParseError,
++    self as t2, build_apdu, build_select, cmd, read_agreement_pubkey, read_otp_pin_flag,
++    serialize_enum_all, validate_otp_pin, DeviceInfo, OtpError, ParseError, PinFlag,
+ };
+ 
+ #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+@@ -56,6 +57,13 @@ pub enum Error {
+     /// A Token2 key was found, but the OTP applet was not reachable over HID or
+     /// CCID.
+     NoUsableInterface,
++    /// A PIN failed the client-side policy check before being sent.
++    InvalidPin(&'static str),
++    /// A verify/remove/change was attempted but no PIN is set on the key.
++    PinNotSet,
++    /// The key has an OTP PIN set and it must be verified before entries can be
++    /// listed. The GUI uses this to prompt for the PIN.
++    PinRequired,
+ }
+ 
+ impl std::fmt::Display for Error {
+@@ -77,6 +85,15 @@ impl std::fmt::Display for Error {
+                 "the OTP applet is not reachable over HID or CCID — HID may be disabled on \
+                  the key; enable it, or use a contact/NFC reader"
+             ),
++            Error::InvalidPin(m) => write!(f, "invalid PIN: {}", m),
++            Error::PinNotSet => write!(
++                f,
++                "no OTP PIN is set on this key — nothing to verify (set one with `pin set`)"
++            ),
++            Error::PinRequired => write!(
++                f,
++                "this key is protected by an OTP PIN — verify the PIN first (pass --pin, or unlock in the GUI)"
++            ),
+         }
+     }
+ }
+@@ -527,6 +544,13 @@ pub struct OtpSession {
+     transport: Box<dyn Transport>,
+     is_pcsc: bool,
+     serial: Option<Vec<u8>>,
++    /// Session keys from a live authenticated ECDH handshake, once
++    /// [`OtpSession::open_session`] has run. Needed to decrypt PIN-protected
++    /// enumeration output and to issue PIN commands.
++    session: Option<crate::crypto::SessionKeys>,
++    /// True once [`OtpSession::verify_pin`] has opened the read window this
++    /// connection, so `enumerate`/`read_entry` know to expect encrypted output.
++    pin_verified: bool,
+ }
+ 
+ /// How long the HID probe waits for the OTP applet to answer over HID before
+@@ -574,6 +598,14 @@ fn probe_hid(t: &mut HidTransport) -> Result<(), Error> {
+     Ok(())
+ }
+ 
++fn hex(b: &[u8]) -> String {
++    let mut o = String::with_capacity(b.len() * 2);
++    for x in b {
++        o.push_str(&format!("{x:02x}"));
++    }
++    o
++}
++
+ impl OtpSession {
+     /// Open using the chosen interface.
+     pub fn open(iface: Interface, debug: bool) -> Result<Self, Error> {
+@@ -607,6 +639,8 @@ impl OtpSession {
+                         transport: Box::new(t),
+                         is_pcsc: false,
+                         serial: None,
++                        session: None,
++                        pin_verified: false,
+                     }),
+                     Err(()) => Err(Error::NoUsableInterface),
+                 }
+@@ -623,12 +657,16 @@ impl OtpSession {
+                 transport: Box::new(t),
+                 is_pcsc: true,
+                 serial: Some(serial),
++                session: None,
++                pin_verified: false,
+             }),
+             Err(_) => match PcScTransport::open_first(debug) {
+                 Ok(t) => Ok(Self {
+                     transport: Box::new(t),
+                     is_pcsc: true,
+                     serial: None,
++                    session: None,
++                    pin_verified: false,
+                 }),
+                 Err(_) => Err(Error::NoUsableInterface),
+             },
+@@ -644,6 +682,8 @@ impl OtpSession {
+             transport: Box::new(t),
+             is_pcsc: false,
+             serial: None,
++            session: None,
++            pin_verified: false,
+         })
+     }
+ 
+@@ -654,6 +694,8 @@ impl OtpSession {
+             transport: Box::new(t),
+             is_pcsc: true,
+             serial: Some(serial),
++            session: None,
++            pin_verified: false,
+         })
+     }
+ 
+@@ -664,6 +706,8 @@ impl OtpSession {
+             transport: Box::new(t),
+             is_pcsc: true,
+             serial: Some(serial),
++            session: None,
++            pin_verified: false,
+         })
+     }
+ 
+@@ -694,18 +738,144 @@ impl OtpSession {
+             }
+             return Err(e.into());
+         }
+-        let mut page = parse_enum_page(&data)?;
++        let page_bytes = self.maybe_decrypt_page(&data)?;
++        let mut page = parse_enum_page(&page_bytes)?;
+         let mut entries = page.entries;
+         while page.more_pages {
+             let cont = build_apdu(cmd::ENUM_CODES_CONTINUE, &timestamp.to_be_bytes());
+             let (data, sw) = self.transport.transmit(&cont, false)?;
+             OtpError::check(sw)?;
+-            page = parse_enum_page(&data)?;
++            let page_bytes = self.maybe_decrypt_page(&data)?;
++            page = parse_enum_page(&page_bytes)?;
+             entries.extend(page.entries);
+         }
+         Ok(entries)
+     }
+ 
++    /// When a PIN is set and has been verified this connection, `ENUM_CODES`
++    /// returns `IV(16) || EncData || EncDataAuth(16)` under the session key
++    /// instead of a plaintext page. Detect that (we only know a PIN is in force
++    /// once `pin_verified` is set) and return the decrypted page bytes;
++    /// otherwise pass the data through unchanged.
++    fn maybe_decrypt_page(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
++        if !self.pin_verified {
++            return Ok(data.to_vec());
++        }
++        let keys = self
++            .session
++            .as_ref()
++            .ok_or(Error::Parse(ParseError::Malformed("no session for PIN decrypt")))?;
++        if data.len() < 16 + 16 + 16 {
++            return Err(Error::Parse(ParseError::Truncated));
++        }
++        let iv: [u8; 16] = data[..16].try_into().expect("checked length");
++        let enc = &data[16..data.len() - 16];
++        let auth = &data[data.len() - 16..];
++        crate::crypto::verify_auth_tag(&keys.mac, enc, auth).map_err(Error::Encrypt)?;
++        let plain = crate::crypto::session_decrypt(&keys.enc, &iv, enc).map_err(Error::Encrypt)?;
++        Ok(plain.to_vec())
++    }
++
++    /// If the key has an OTP PIN set, verify `pin` to open the read/write
++    /// window for this session; if no PIN is set, this is a no-op. Write and
++    /// touch-read commands need the window open just like enumeration does, so
++    /// call this right after opening a session that will write to a
++    /// possibly-protected key. Returns [`Error::PinRequired`] when a PIN is set
++    /// but `pin` is `None`.
++    pub fn unlock_if_pinned(&mut self, pin: Option<&str>) -> Result<(), Error> {
++        if self.pin_is_set()? {
++            match pin {
++                Some(p) => self.verify_pin(p)?,
++                None => return Err(Error::PinRequired),
++            }
++        }
++        Ok(())
++    }
++
++    /// Close the PIN read/write window immediately (the window a `verify_pin`
++    /// opens for ~5 minutes). Sends the lock form of `VERIFY_OTP_PIN` (body =
++    /// a single `0x00`). After this, protected reads/writes need a fresh verify.
++    pub fn lock_pin(&mut self) -> Result<(), Error> {
++        let apdu = t2::lock_otp_pin();
++        let (_, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        self.pin_verified = false;
++        Ok(())
++    }
++
++    /// Re-open the read/write window with an already-known PIN, without a full
++    /// re-handshake if a session is live. Used by a keep-unlocked keep-alive to
++    /// refresh the window before the device's ~5-minute timeout. Equivalent to
++    /// `verify_pin` but named for intent; safe to call repeatedly.
++    pub fn reverify_pin(&mut self, pin: &str) -> Result<(), Error> {
++        self.verify_pin(pin)
++    }
++
++    /// Write an entry, transparently handling a PIN-protected key. If a PIN is
++    /// set, `pin` must be supplied: it is verified first (which opens the write
++    /// window AND captures the agreement pubkey the seal needs, since
++    /// `GET_ECDH_PUBKEY` is rejected while a PIN exists). On an unprotected key
++    /// this is just `write_entry`. Returns [`Error::PinRequired`] if a PIN is set
++    /// but `pin` is `None`.
++    pub fn write_entry_pinned(
++        &mut self,
++        entry: &WriteEntry<'_>,
++        pin: Option<&str>,
++    ) -> Result<(), Error> {
++        // If the window is already open this session (e.g. the caller passed
++        // --pin, which `open()` already verified), the agreement pubkey is
++        // cached and we can write straight away. Only verify if it isn't.
++        if !self.pin_verified && self.pin_is_set()? {
++            match pin {
++                Some(p) => self.verify_pin(p)?,
++                None => return Err(Error::PinRequired),
++            }
++        }
++        self.write_entry(entry)
++    }
++
++    /// Delete an entry, transparently handling a PIN-protected key (see
++    /// [`OtpSession::write_entry_pinned`]). Delete is a seed-write with an empty
++    /// seed, so it takes the same protected-write path.
++    pub fn delete_entry_pinned(
++        &mut self,
++        app_name: &str,
++        account_name: &str,
++        pin: Option<&str>,
++    ) -> Result<(), Error> {
++        if !self.pin_verified && self.pin_is_set()? {
++            match pin {
++                Some(p) => self.verify_pin(p)?,
++                None => return Err(Error::PinRequired),
++            }
++        }
++        self.delete_entry(app_name, account_name)
++    }
++
++    /// Returns true if the key currently has an OTP PIN set (a quick flag read
++    /// that needs no session).
++    pub fn pin_is_set(&mut self) -> Result<bool, Error> {
++        Ok(self.pin_status()?.is_set())
++    }
++
++    /// List entries, transparently handling a PIN-protected key. If a PIN is
++    /// set, `pin` must be supplied (it is verified to open the read window);
++    /// when a PIN is set but `pin` is `None`, returns [`Error::PinRequired`] so
++    /// a caller (e.g. the GUI) can prompt for it.
++    pub fn enumerate_pinned(
++        &mut self,
++        timestamp: u64,
++        pin: Option<&str>,
++    ) -> Result<Vec<Entry>, Error> {
++        if self.pin_is_set()? {
++            match pin {
++                Some(p) => self.verify_pin(p)?,
++                None => return Err(Error::PinRequired),
++            }
++        }
++        self.enumerate(timestamp)
++    }
++
+     /// Read a single entry by `(app, account)`, returning its live code. A
+     /// button-required entry blocks until the user touches the key.
+     pub fn read_entry(
+@@ -718,6 +888,9 @@ impl OtpSession {
+         let apdu = build_apdu(cmd::ENUM_CODES, &body);
+         let (data, sw) = self.transport.transmit(&apdu, true)?;
+         OtpError::check(sw)?;
++        // On a PIN-protected key (after verify), the single-entry read is
++        // returned encrypted just like enumeration; decrypt if the window is open.
++        let data = self.maybe_decrypt_page(&data)?;
+         Ok(parse_read_one(&data)?)
+     }
+ 
+@@ -779,8 +952,179 @@ impl OtpSession {
+         Ok(t2::parse_serial(&data)?)
+     }
+ 
++
++    // --- OTP PIN (privacy protection, R3.4 / manual V1.2) -------------------
++
++    /// Read the device's OTP-PIN status without opening a session.
++    pub fn pin_status(&mut self) -> Result<PinFlag, Error> {
++        let apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_BASE);
++        let (data, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        Ok(PinFlag::parse(&data)?)
++    }
++
++    /// Establish an authenticated ECDH session (`READ_AGREEMENT_PUBKEY`) and
++    /// cache the derived keys on this session. Required before any PIN command
++    /// and before reading PIN-protected entries.
++    ///
++    /// NOTE: the protocol document specifies that the device also returns an
++    /// ECC-P521 signature over `hostPub || devPub` that the host *should* verify
++    /// against the device's known P-521 key. This client does **not** verify
++    /// that signature: the P-256 crate in the dependency set cannot check a
++    /// P-521 signature, and adding a P-521 verifier is out of scope here. The
++    /// ECDH exchange still provides session confidentiality, but device
++    /// *authenticity* is not cryptographically checked. See the README security
++    /// note before relying on this against an untrusted reader.
++    pub fn open_session(&mut self) -> Result<(), Error> {
++        use p256::elliptic_curve::sec1::ToEncodedPoint;
++        use p256::SecretKey;
++        use rand_core::OsRng;
++
++        // The Token2 reference sequence reads the PIN flag FIRST (Lc=09) before
++        // the handshake — this primes/initializes the device PIN state. Skipping
++        // it makes a subsequent SET fail with 6985 (conditions not satisfied).
++        let prime = read_otp_pin_flag(0x09);
++        let (_pdata, psw) = self.transport.transmit(&prime, false)?;
++        OtpError::check_pin(psw)?;
++
++        // One host ephemeral keypair: send its public half, derive keys from the
++        // device's agreement key in the response against this same secret.
++        let host_secret = SecretKey::random(&mut OsRng);
++        let host_point = host_secret.public_key().to_encoded_point(false);
++        let mut host_xy = [0u8; 64];
++        host_xy.copy_from_slice(&host_point.as_bytes()[1..]);
++
++        let apdu = read_agreement_pubkey(&host_xy);
++        let (data, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        // Response: devPub(64) || sig(132). We consume devPub; sig is currently
++        // unverified (see the doc-comment above).
++        if data.len() < 64 {
++            return Err(Error::Parse(ParseError::Truncated));
++        }
++        let dev_xy = &data[..64];
++
++        let keys = crate::crypto::derive_session_keys(&host_secret, dev_xy)
++            .map_err(Error::Encrypt)?;
++        self.session = Some(keys);
++        self.pin_verified = false;
++        Ok(())
++    }
++
++    /// Set an OTP PIN on a currently-unprotected device.
++    pub fn set_pin(&mut self, pin: &str) -> Result<(), Error> {
++        validate_otp_pin(pin).map_err(Error::InvalidPin)?;
++        self.ensure_session()?;
++        let keys = self.session.as_ref().expect("session ensured above");
++        let data = crate::crypto::build_set_pin_data(keys, pin.as_bytes(), 0x64);
++        let apdu = build_apdu(t2::cmd::SET_OTP_PIN, &data);
++        let (_, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        Ok(())
++    }
++
++    /// Verify the OTP PIN, opening the device read window for this connection so
++    /// subsequent `enumerate`/`read_entry` calls return usable codes.
++    pub fn verify_pin(&mut self, pin: &str) -> Result<(), Error> {
++        self.ensure_session()?;
++        // Fetch the verify challenge: IV || EncRand (Lc = 0x29).
++        let flag_apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
++        let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
++        OtpError::check_pin(sw)?;
++        let flag = PinFlag::parse(&data)?;
++        if !flag.is_set() {
++            return Err(Error::PinNotSet);
++        }
++        let (iv, enc_rand) = flag
++            .challenge
++            .ok_or(Error::Parse(ParseError::Malformed("verify challenge missing")))?;
++
++        let keys = self.session.as_ref().expect("session ensured above");
++        // Rand is a raw 16-byte block with NO PKCS#7 padding — decrypt without
++        // unpadding (matching the reference client's plain AES-CBC decrypt).
++        let rand = crate::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
++        if rand.len() != 16 {
++            return Err(Error::Encrypt(crate::crypto::EncryptError::BadCiphertext));
++        }
++
++        // VERIFY proof (Token2 reference construction): nested AES-CBC —
++        // inner = AES(SHA256(pin), SHA256(rand)[:16], rand);
++        // outer = AES(SessionEncKey, randomIV, inner); data = IV || outer.
++        let data_field = crate::crypto::build_verify_pin_data(keys, pin.as_bytes(), &rand);
++        let apdu = build_apdu(t2::cmd::VERIFY_OTP_PIN, &data_field);
++        let (_, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        self.pin_verified = true;
++        Ok(())
++    }
++
++    /// Change the OTP PIN (requires knowing the current PIN).
++    pub fn change_pin(&mut self, current: &str, new: &str) -> Result<(), Error> {
++        validate_otp_pin(new).map_err(Error::InvalidPin)?;
++        self.change_pin_inner(current, Some(new))
++    }
++
++    /// Remove the OTP PIN (a change to length 0; requires the current PIN).
++    pub fn remove_pin(&mut self, current: &str) -> Result<(), Error> {
++        self.change_pin_inner(current, None)
++    }
++
++    fn change_pin_inner(&mut self, current: &str, new: Option<&str>) -> Result<(), Error> {
++        self.ensure_session()?;
++        // The change proof binds the current PIN to the fresh Rand, like verify.
++        let flag_apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
++        let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
++        OtpError::check_pin(sw)?;
++        let flag = PinFlag::parse(&data)?;
++        let (iv, enc_rand) = flag
++            .challenge
++            .ok_or(Error::Parse(ParseError::Malformed("change challenge missing")))?;
++        let keys = self.session.as_ref().expect("session ensured above");
++        let rand = crate::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
++        if rand.len() != 16 {
++            return Err(Error::Encrypt(crate::crypto::EncryptError::BadCiphertext));
++        }
++
++        let new_bytes = new.map(|s| s.as_bytes()).unwrap_or(&[]);
++        let data_field =
++            crate::crypto::build_change_pin_data(keys, new_bytes, current.as_bytes(), &rand);
++        let apdu = build_apdu(t2::cmd::CHANGE_OTP_PIN, &data_field);
++        let (_, sw) = self.transport.transmit(&apdu, false)?;
++        OtpError::check_pin(sw)?;
++        self.pin_verified = false;
++        Ok(())
++    }
++
++    /// Open an authenticated session if one is not already cached.
++    fn ensure_session(&mut self) -> Result<(), Error> {
++        if self.session.is_none() {
++            self.open_session()?;
++        }
++        Ok(())
++    }
++
+     /// ECDH handshake: fetch the device pubkey, then seal `cleartext`.
+     fn seal(&mut self, cleartext: &[u8]) -> Result<Vec<u8>, Error> {
++        // Two write encryptions, chosen by PIN state:
++        //
++        //  * PIN window open (pin_verified): the device rejects GET_ECDH_PUBKEY
++        //    with 6A81, so there is no ECDH blob. Instead the write reuses the
++        //    verified PIN session keys, in the same authenticated format as
++        //    PIN-mode reads reversed: IV || AES-CBC(SessionEncKey, IV, pt) ||
++        //    HMAC(SessionMacKey, EncData)[:16]. (This is what the Token2
++        //    companion app sends; confirmed against a device capture.)
++        //
++        //  * Otherwise (unprotected key): fetch a fresh ephemeral device pubkey
++        //    via GET_ECDH_PUBKEY and build the standard ECDH seed blob.
++        if self.pin_verified {
++            let keys = self
++                .session
++                .as_ref()
++                .ok_or(Error::Parse(ParseError::Malformed(
++                    "PIN verified but no session keys",
++                )))?;
++            return Ok(crypto::build_protected_write_data(keys, cleartext));
++        }
+         let (device_pub, sw) = self.transport.transmit(&t2::get_ecdh_pubkey(), false)?;
+         OtpError::check(sw)?;
+         // The byte layer requires the IV; entries use IV_OTP.
