@@ -229,6 +229,7 @@ USAGE:
 GLOBAL OPTS:
     --transport <auto|hid|nfc>   Interface to use (default: auto)
     --reader <name>              Pin a specific PC/SC reader (serial-confirmed)
+    --pin                        Verify the OTP PIN first (read from $T2TOTP_PIN/stdin)
     --debug                      Trace device I/O on stderr
 
 COMMANDS:
@@ -244,6 +245,10 @@ COMMANDS:
                                    --touch           require a button press to emit the code
     delete <issuer> <account>    Delete a profile
     erase --yes                  Erase ALL profiles on the key
+    pin status                   Show OTP-PIN state (set?, retries left)
+    pin set                      Set an OTP PIN (privacy protection)
+    pin change                   Change the OTP PIN
+    pin remove                   Remove the OTP PIN
 ```
 
 **The secret is never passed on the command line.** `add` reads the Base32
@@ -279,6 +284,68 @@ t2totp --reader "ACS ACR1252 1S CL Reader" list
 t2totp delete O365 alice@example.com
 t2totp erase --yes
 ```
+
+### OTP PIN (privacy protection)
+
+Keys on **R3.4** firmware (manual V1.2) support an *OTP PIN* that gates read
+access to stored codes. Once a PIN is set, the key returns encrypted
+enumeration data, and a tool must run an authenticated ECDH session and verify
+the PIN to open a short read window before it can show codes.
+
+```sh
+# Check whether a PIN is set (and how many retries remain)
+t2totp pin status
+
+# Set / change / remove the PIN (prompted; or via $T2TOTP_PIN)
+t2totp pin set
+t2totp pin change
+t2totp pin remove
+
+# On a PIN-protected key, add --pin so list/code can return codes
+t2totp --pin list
+t2totp --pin code O365 alice@example.com
+```
+
+Like the TOTP secret, **the PIN is never passed on the command line** — it is
+read from **stdin** or the **`T2TOTP_PIN`** environment variable. The
+client-side policy check mirrors the firmware's rules (numeric ≥ 6 digits with
+no trivial sequences/repeats; alphanumeric ≥ 10 chars mixing at least two
+character classes).
+
+The OTP-PIN commands (`status` / `set` / `verify` / `change` / `remove`) are
+confirmed working against R3.4 firmware, over CCID/PC-SC, with the session
+crypto matching the Token2 reference client (`token2-otp-cli`).
+
+> ⚠️ **Security note.** The device also returns a P-521 signature over the
+> session handshake that a host *should* verify to authenticate the key. This
+> client establishes the encrypted ECDH session but does **not** verify that
+> signature (the bundled P-256 stack can't check a P-521 signature), so device
+> *authenticity* is not cryptographically checked — keep that in mind on an
+> untrusted reader.
+>
+> There is no PIN-only reset: if you forget the PIN, `t2totp erase --yes` wipes
+> all OTP entries and clears the PIN.
+
+In the **desktop GUI** (`t2totp-gui`), a PIN-protected key prompts for its PIN
+before listing codes; PIN set / change / remove live under **Settings → Manage
+OTP PIN**.
+
+Adding or deleting entries on a PIN-protected key works too. The client verifies
+the PIN first (opening the write window), then writes the seed using the verified
+PIN session keys rather than an ECDH blob: on a protected key `GET_ECDH_PUBKEY` is
+rejected, so the write is sealed in the same authenticated session format as
+PIN-mode reads reversed — `IV || AES-CBC(SessionEncKey, IV, entry) ||
+HMAC(SessionMacKey, EncData)`. Pass `--pin` to `add`/`delete` on the CLI; the GUI
+uses the PIN you unlocked with.
+
+The device closes the read/write window automatically after ~5 minutes. `t2totp
+pin lock` closes it immediately. In the GUI, a lock button (🔒) appears in the
+toolbar whenever a protected key is unlocked; clicking it closes the window and
+hides the codes. **Settings → Manage OTP PIN** also offers "Keep unlocked until I
+lock or unplug" — while on, the app re-verifies with the PIN you entered before
+each timeout, so the window stays open until you lock it (toolbar 🔒 or "Lock
+now") or remove the key. The PIN is held in memory only, for that session, and the
+code list is hidden whenever the key is locked.
 
 ### Provisioning test profiles
 

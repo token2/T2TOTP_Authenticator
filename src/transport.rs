@@ -20,7 +20,8 @@ use crate::entry::{
 };
 use crate::hidframe::{self, ResponseAssembler, Step};
 use crate::proto::{
-    self as t2, build_apdu, build_select, cmd, serialize_enum_all, DeviceInfo, OtpError, ParseError,
+    self as t2, build_apdu, build_select, cmd, read_agreement_pubkey, read_otp_pin_flag,
+    serialize_enum_all, validate_otp_pin, DeviceInfo, OtpError, ParseError, PinFlag,
 };
 
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
@@ -56,6 +57,13 @@ pub enum Error {
     /// A Token2 key was found, but the OTP applet was not reachable over HID or
     /// CCID.
     NoUsableInterface,
+    /// A PIN failed the client-side policy check before being sent.
+    InvalidPin(&'static str),
+    /// A verify/remove/change was attempted but no PIN is set on the key.
+    PinNotSet,
+    /// The key has an OTP PIN set and it must be verified before entries can be
+    /// listed. The GUI uses this to prompt for the PIN.
+    PinRequired,
 }
 
 impl std::fmt::Display for Error {
@@ -76,6 +84,15 @@ impl std::fmt::Display for Error {
                 f,
                 "the OTP applet is not reachable over HID or CCID — HID may be disabled on \
                  the key; enable it, or use a contact/NFC reader"
+            ),
+            Error::InvalidPin(m) => write!(f, "invalid PIN: {}", m),
+            Error::PinNotSet => write!(
+                f,
+                "no OTP PIN is set on this key — nothing to verify (set one with `pin set`)"
+            ),
+            Error::PinRequired => write!(
+                f,
+                "this key is protected by an OTP PIN — verify the PIN first (pass --pin, or unlock in the GUI)"
             ),
         }
     }
@@ -527,6 +544,13 @@ pub struct OtpSession {
     transport: Box<dyn Transport>,
     is_pcsc: bool,
     serial: Option<Vec<u8>>,
+    /// Session keys from a live authenticated ECDH handshake, once
+    /// [`OtpSession::open_session`] has run. Needed to decrypt PIN-protected
+    /// enumeration output and to issue PIN commands.
+    session: Option<crate::crypto::SessionKeys>,
+    /// True once [`OtpSession::verify_pin`] has opened the read window this
+    /// connection, so `enumerate`/`read_entry` know to expect encrypted output.
+    pin_verified: bool,
 }
 
 /// How long the HID probe waits for the OTP applet to answer over HID before
@@ -574,6 +598,14 @@ fn probe_hid(t: &mut HidTransport) -> Result<(), Error> {
     Ok(())
 }
 
+fn hex(b: &[u8]) -> String {
+    let mut o = String::with_capacity(b.len() * 2);
+    for x in b {
+        o.push_str(&format!("{x:02x}"));
+    }
+    o
+}
+
 impl OtpSession {
     /// Open using the chosen interface.
     pub fn open(iface: Interface, debug: bool) -> Result<Self, Error> {
@@ -607,6 +639,8 @@ impl OtpSession {
                         transport: Box::new(t),
                         is_pcsc: false,
                         serial: None,
+                        session: None,
+                        pin_verified: false,
                     }),
                     Err(()) => Err(Error::NoUsableInterface),
                 }
@@ -623,12 +657,16 @@ impl OtpSession {
                 transport: Box::new(t),
                 is_pcsc: true,
                 serial: Some(serial),
+                session: None,
+                pin_verified: false,
             }),
             Err(_) => match PcScTransport::open_first(debug) {
                 Ok(t) => Ok(Self {
                     transport: Box::new(t),
                     is_pcsc: true,
                     serial: None,
+                    session: None,
+                    pin_verified: false,
                 }),
                 Err(_) => Err(Error::NoUsableInterface),
             },
@@ -644,6 +682,8 @@ impl OtpSession {
             transport: Box::new(t),
             is_pcsc: false,
             serial: None,
+            session: None,
+            pin_verified: false,
         })
     }
 
@@ -654,6 +694,8 @@ impl OtpSession {
             transport: Box::new(t),
             is_pcsc: true,
             serial: Some(serial),
+            session: None,
+            pin_verified: false,
         })
     }
 
@@ -664,6 +706,8 @@ impl OtpSession {
             transport: Box::new(t),
             is_pcsc: true,
             serial: Some(serial),
+            session: None,
+            pin_verified: false,
         })
     }
 
@@ -694,16 +738,142 @@ impl OtpSession {
             }
             return Err(e.into());
         }
-        let mut page = parse_enum_page(&data)?;
+        let page_bytes = self.maybe_decrypt_page(&data)?;
+        let mut page = parse_enum_page(&page_bytes)?;
         let mut entries = page.entries;
         while page.more_pages {
             let cont = build_apdu(cmd::ENUM_CODES_CONTINUE, &timestamp.to_be_bytes());
             let (data, sw) = self.transport.transmit(&cont, false)?;
             OtpError::check(sw)?;
-            page = parse_enum_page(&data)?;
+            let page_bytes = self.maybe_decrypt_page(&data)?;
+            page = parse_enum_page(&page_bytes)?;
             entries.extend(page.entries);
         }
         Ok(entries)
+    }
+
+    /// When a PIN is set and has been verified this connection, `ENUM_CODES`
+    /// returns `IV(16) || EncData || EncDataAuth(16)` under the session key
+    /// instead of a plaintext page. Detect that (we only know a PIN is in force
+    /// once `pin_verified` is set) and return the decrypted page bytes;
+    /// otherwise pass the data through unchanged.
+    fn maybe_decrypt_page(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.pin_verified {
+            return Ok(data.to_vec());
+        }
+        let keys = self
+            .session
+            .as_ref()
+            .ok_or(Error::Parse(ParseError::Malformed("no session for PIN decrypt")))?;
+        if data.len() < 16 + 16 + 16 {
+            return Err(Error::Parse(ParseError::Truncated));
+        }
+        let iv: [u8; 16] = data[..16].try_into().expect("checked length");
+        let enc = &data[16..data.len() - 16];
+        let auth = &data[data.len() - 16..];
+        crate::crypto::verify_auth_tag(&keys.mac, enc, auth).map_err(Error::Encrypt)?;
+        let plain = crate::crypto::session_decrypt(&keys.enc, &iv, enc).map_err(Error::Encrypt)?;
+        Ok(plain.to_vec())
+    }
+
+    /// If the key has an OTP PIN set, verify `pin` to open the read/write
+    /// window for this session; if no PIN is set, this is a no-op. Write and
+    /// touch-read commands need the window open just like enumeration does, so
+    /// call this right after opening a session that will write to a
+    /// possibly-protected key. Returns [`Error::PinRequired`] when a PIN is set
+    /// but `pin` is `None`.
+    pub fn unlock_if_pinned(&mut self, pin: Option<&str>) -> Result<(), Error> {
+        if self.pin_is_set()? {
+            match pin {
+                Some(p) => self.verify_pin(p)?,
+                None => return Err(Error::PinRequired),
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the PIN read/write window immediately (the window a `verify_pin`
+    /// opens for ~5 minutes). Sends the lock form of `VERIFY_OTP_PIN` (body =
+    /// a single `0x00`). After this, protected reads/writes need a fresh verify.
+    pub fn lock_pin(&mut self) -> Result<(), Error> {
+        let apdu = t2::lock_otp_pin();
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        self.pin_verified = false;
+        Ok(())
+    }
+
+    /// Re-open the read/write window with an already-known PIN, without a full
+    /// re-handshake if a session is live. Used by a keep-unlocked keep-alive to
+    /// refresh the window before the device's ~5-minute timeout. Equivalent to
+    /// `verify_pin` but named for intent; safe to call repeatedly.
+    pub fn reverify_pin(&mut self, pin: &str) -> Result<(), Error> {
+        self.verify_pin(pin)
+    }
+
+    /// Write an entry, transparently handling a PIN-protected key. If a PIN is
+    /// set, `pin` must be supplied: it is verified first (which opens the write
+    /// window AND captures the agreement pubkey the seal needs, since
+    /// `GET_ECDH_PUBKEY` is rejected while a PIN exists). On an unprotected key
+    /// this is just `write_entry`. Returns [`Error::PinRequired`] if a PIN is set
+    /// but `pin` is `None`.
+    pub fn write_entry_pinned(
+        &mut self,
+        entry: &WriteEntry<'_>,
+        pin: Option<&str>,
+    ) -> Result<(), Error> {
+        // If the window is already open this session (e.g. the caller passed
+        // --pin, which `open()` already verified), the agreement pubkey is
+        // cached and we can write straight away. Only verify if it isn't.
+        if !self.pin_verified && self.pin_is_set()? {
+            match pin {
+                Some(p) => self.verify_pin(p)?,
+                None => return Err(Error::PinRequired),
+            }
+        }
+        self.write_entry(entry)
+    }
+
+    /// Delete an entry, transparently handling a PIN-protected key (see
+    /// [`OtpSession::write_entry_pinned`]). Delete is a seed-write with an empty
+    /// seed, so it takes the same protected-write path.
+    pub fn delete_entry_pinned(
+        &mut self,
+        app_name: &str,
+        account_name: &str,
+        pin: Option<&str>,
+    ) -> Result<(), Error> {
+        if !self.pin_verified && self.pin_is_set()? {
+            match pin {
+                Some(p) => self.verify_pin(p)?,
+                None => return Err(Error::PinRequired),
+            }
+        }
+        self.delete_entry(app_name, account_name)
+    }
+
+    /// Returns true if the key currently has an OTP PIN set (a quick flag read
+    /// that needs no session).
+    pub fn pin_is_set(&mut self) -> Result<bool, Error> {
+        Ok(self.pin_status()?.is_set())
+    }
+
+    /// List entries, transparently handling a PIN-protected key. If a PIN is
+    /// set, `pin` must be supplied (it is verified to open the read window);
+    /// when a PIN is set but `pin` is `None`, returns [`Error::PinRequired`] so
+    /// a caller (e.g. the GUI) can prompt for it.
+    pub fn enumerate_pinned(
+        &mut self,
+        timestamp: u64,
+        pin: Option<&str>,
+    ) -> Result<Vec<Entry>, Error> {
+        if self.pin_is_set()? {
+            match pin {
+                Some(p) => self.verify_pin(p)?,
+                None => return Err(Error::PinRequired),
+            }
+        }
+        self.enumerate(timestamp)
     }
 
     /// Read a single entry by `(app, account)`, returning its live code. A
@@ -718,6 +888,9 @@ impl OtpSession {
         let apdu = build_apdu(cmd::ENUM_CODES, &body);
         let (data, sw) = self.transport.transmit(&apdu, true)?;
         OtpError::check(sw)?;
+        // On a PIN-protected key (after verify), the single-entry read is
+        // returned encrypted just like enumeration; decrypt if the window is open.
+        let data = self.maybe_decrypt_page(&data)?;
         Ok(parse_read_one(&data)?)
     }
 
@@ -779,8 +952,179 @@ impl OtpSession {
         Ok(t2::parse_serial(&data)?)
     }
 
+
+    // --- OTP PIN (privacy protection, R3.4 / manual V1.2) -------------------
+
+    /// Read the device's OTP-PIN status without opening a session.
+    pub fn pin_status(&mut self) -> Result<PinFlag, Error> {
+        let apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_BASE);
+        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        Ok(PinFlag::parse(&data)?)
+    }
+
+    /// Establish an authenticated ECDH session (`READ_AGREEMENT_PUBKEY`) and
+    /// cache the derived keys on this session. Required before any PIN command
+    /// and before reading PIN-protected entries.
+    ///
+    /// NOTE: the protocol document specifies that the device also returns an
+    /// ECC-P521 signature over `hostPub || devPub` that the host *should* verify
+    /// against the device's known P-521 key. This client does **not** verify
+    /// that signature: the P-256 crate in the dependency set cannot check a
+    /// P-521 signature, and adding a P-521 verifier is out of scope here. The
+    /// ECDH exchange still provides session confidentiality, but device
+    /// *authenticity* is not cryptographically checked. See the README security
+    /// note before relying on this against an untrusted reader.
+    pub fn open_session(&mut self) -> Result<(), Error> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::SecretKey;
+        use rand_core::OsRng;
+
+        // The Token2 reference sequence reads the PIN flag FIRST (Lc=09) before
+        // the handshake — this primes/initializes the device PIN state. Skipping
+        // it makes a subsequent SET fail with 6985 (conditions not satisfied).
+        let prime = read_otp_pin_flag(0x09);
+        let (_pdata, psw) = self.transport.transmit(&prime, false)?;
+        OtpError::check_pin(psw)?;
+
+        // One host ephemeral keypair: send its public half, derive keys from the
+        // device's agreement key in the response against this same secret.
+        let host_secret = SecretKey::random(&mut OsRng);
+        let host_point = host_secret.public_key().to_encoded_point(false);
+        let mut host_xy = [0u8; 64];
+        host_xy.copy_from_slice(&host_point.as_bytes()[1..]);
+
+        let apdu = read_agreement_pubkey(&host_xy);
+        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        // Response: devPub(64) || sig(132). We consume devPub; sig is currently
+        // unverified (see the doc-comment above).
+        if data.len() < 64 {
+            return Err(Error::Parse(ParseError::Truncated));
+        }
+        let dev_xy = &data[..64];
+
+        let keys = crate::crypto::derive_session_keys(&host_secret, dev_xy)
+            .map_err(Error::Encrypt)?;
+        self.session = Some(keys);
+        self.pin_verified = false;
+        Ok(())
+    }
+
+    /// Set an OTP PIN on a currently-unprotected device.
+    pub fn set_pin(&mut self, pin: &str) -> Result<(), Error> {
+        validate_otp_pin(pin).map_err(Error::InvalidPin)?;
+        self.ensure_session()?;
+        let keys = self.session.as_ref().expect("session ensured above");
+        let data = crate::crypto::build_set_pin_data(keys, pin.as_bytes(), 0x64);
+        let apdu = build_apdu(t2::cmd::SET_OTP_PIN, &data);
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        Ok(())
+    }
+
+    /// Verify the OTP PIN, opening the device read window for this connection so
+    /// subsequent `enumerate`/`read_entry` calls return usable codes.
+    pub fn verify_pin(&mut self, pin: &str) -> Result<(), Error> {
+        self.ensure_session()?;
+        // Fetch the verify challenge: IV || EncRand (Lc = 0x29).
+        let flag_apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
+        let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
+        OtpError::check_pin(sw)?;
+        let flag = PinFlag::parse(&data)?;
+        if !flag.is_set() {
+            return Err(Error::PinNotSet);
+        }
+        let (iv, enc_rand) = flag
+            .challenge
+            .ok_or(Error::Parse(ParseError::Malformed("verify challenge missing")))?;
+
+        let keys = self.session.as_ref().expect("session ensured above");
+        // Rand is a raw 16-byte block with NO PKCS#7 padding — decrypt without
+        // unpadding (matching the reference client's plain AES-CBC decrypt).
+        let rand = crate::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
+        if rand.len() != 16 {
+            return Err(Error::Encrypt(crate::crypto::EncryptError::BadCiphertext));
+        }
+
+        // VERIFY proof (Token2 reference construction): nested AES-CBC —
+        // inner = AES(SHA256(pin), SHA256(rand)[:16], rand);
+        // outer = AES(SessionEncKey, randomIV, inner); data = IV || outer.
+        let data_field = crate::crypto::build_verify_pin_data(keys, pin.as_bytes(), &rand);
+        let apdu = build_apdu(t2::cmd::VERIFY_OTP_PIN, &data_field);
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        self.pin_verified = true;
+        Ok(())
+    }
+
+    /// Change the OTP PIN (requires knowing the current PIN).
+    pub fn change_pin(&mut self, current: &str, new: &str) -> Result<(), Error> {
+        validate_otp_pin(new).map_err(Error::InvalidPin)?;
+        self.change_pin_inner(current, Some(new))
+    }
+
+    /// Remove the OTP PIN (a change to length 0; requires the current PIN).
+    pub fn remove_pin(&mut self, current: &str) -> Result<(), Error> {
+        self.change_pin_inner(current, None)
+    }
+
+    fn change_pin_inner(&mut self, current: &str, new: Option<&str>) -> Result<(), Error> {
+        self.ensure_session()?;
+        // The change proof binds the current PIN to the fresh Rand, like verify.
+        let flag_apdu = read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
+        let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
+        OtpError::check_pin(sw)?;
+        let flag = PinFlag::parse(&data)?;
+        let (iv, enc_rand) = flag
+            .challenge
+            .ok_or(Error::Parse(ParseError::Malformed("change challenge missing")))?;
+        let keys = self.session.as_ref().expect("session ensured above");
+        let rand = crate::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
+        if rand.len() != 16 {
+            return Err(Error::Encrypt(crate::crypto::EncryptError::BadCiphertext));
+        }
+
+        let new_bytes = new.map(|s| s.as_bytes()).unwrap_or(&[]);
+        let data_field =
+            crate::crypto::build_change_pin_data(keys, new_bytes, current.as_bytes(), &rand);
+        let apdu = build_apdu(t2::cmd::CHANGE_OTP_PIN, &data_field);
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check_pin(sw)?;
+        self.pin_verified = false;
+        Ok(())
+    }
+
+    /// Open an authenticated session if one is not already cached.
+    fn ensure_session(&mut self) -> Result<(), Error> {
+        if self.session.is_none() {
+            self.open_session()?;
+        }
+        Ok(())
+    }
+
     /// ECDH handshake: fetch the device pubkey, then seal `cleartext`.
     fn seal(&mut self, cleartext: &[u8]) -> Result<Vec<u8>, Error> {
+        // Two write encryptions, chosen by PIN state:
+        //
+        //  * PIN window open (pin_verified): the device rejects GET_ECDH_PUBKEY
+        //    with 6A81, so there is no ECDH blob. Instead the write reuses the
+        //    verified PIN session keys, in the same authenticated format as
+        //    PIN-mode reads reversed: IV || AES-CBC(SessionEncKey, IV, pt) ||
+        //    HMAC(SessionMacKey, EncData)[:16]. (This is what the Token2
+        //    companion app sends; confirmed against a device capture.)
+        //
+        //  * Otherwise (unprotected key): fetch a fresh ephemeral device pubkey
+        //    via GET_ECDH_PUBKEY and build the standard ECDH seed blob.
+        if self.pin_verified {
+            let keys = self
+                .session
+                .as_ref()
+                .ok_or(Error::Parse(ParseError::Malformed(
+                    "PIN verified but no session keys",
+                )))?;
+            return Ok(crypto::build_protected_write_data(keys, cleartext));
+        }
         let (device_pub, sw) = self.transport.transmit(&t2::get_ecdh_pubkey(), false)?;
         OtpError::check(sw)?;
         // The byte layer requires the IV; entries use IV_OTP.

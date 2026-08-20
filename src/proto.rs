@@ -48,6 +48,26 @@ pub mod cmd {
     pub const SUB_READ_ONE: u8 = 0x01;
     /// ENUM_CODES subcommand: paginated read-all.
     pub const SUB_READ_ALL: u8 = 0x03;
+
+    // --- OTP PIN / privacy protection (R3.4 / manual V1.2) -------------------
+    /// `READ_OTP_PIN_FLAG` — device returns PIN status; Lc selects how much.
+    pub const READ_OTP_PIN_FLAG: [u8; 4] = [0x80, 0xC5, 0x05, 0x04];
+    /// `SET_OTP_PIN` — set a PIN from the unprotected state.
+    pub const SET_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x05];
+    /// `VERIFY_OTP_PIN` — open a read window.
+    pub const VERIFY_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x06];
+    /// `CHANGE_OTP_PIN` — change or remove an existing PIN.
+    pub const CHANGE_OTP_PIN: [u8; 4] = [0x80, 0xC5, 0x05, 0x08];
+    /// `READ_AGREEMENT_PUBKEY` — establish the authenticated ECDH session.
+    pub const READ_AGREEMENT_PUBKEY: [u8; 4] = [0x80, 0xC5, 0x05, 0x09];
+
+    /// Lc for the short PIN-flag read: `PinAlgId,PinRetry,OtpPinLen,PinMaxRetry`.
+    pub const PIN_FLAG_LC_BASE: u8 = 0x04;
+    /// Lc for the PIN-flag read that also returns the verify challenge
+    /// (`... || IV(16) || EncRand(16)`).
+    pub const PIN_FLAG_LC_CHALLENGE: u8 = 0x29;
+    /// AES-256 PIN algorithm id used in the NewPin block.
+    pub const PIN_ALG_AES256: u8 = 0x07;
 }
 
 /// ISO-7816 status words this applet returns.
@@ -58,6 +78,19 @@ pub mod sw {
     pub const NOT_ENOUGH_SPACE: u16 = 0x6A84;
     pub const HID_NOT_SUPPORTED: u16 = 0x6A86;
     pub const BUTTON_TIMEOUT: u16 = 0x6FF9;
+    /// `6A81` — function not supported in the current state (e.g. SET_OTP_PIN
+    /// when a PIN already exists).
+    pub const NOT_ALLOWED: u16 = 0x6A81;
+    /// `6982` — security status not satisfied (PIN not verified / wrong PIN).
+    pub const SECURITY_NOT_SATISFIED: u16 = 0x6982;
+    /// `6983` — authentication method blocked (PIN locked out).
+    pub const PIN_BLOCKED: u16 = 0x6983;
+    /// `6A86` — incorrect P1/P2: on this applet it means the command is not
+    /// implemented by the firmware (the manual flags this as model-specific).
+    pub const WRONG_P1P2: u16 = 0x6A86;
+    /// `6AF8` — Token2-proprietary parameter/framing error (e.g. a case-2 read
+    /// whose length byte the applet misread as an Lc). NOT "unsupported".
+    pub const PROPRIETARY_PARAM_ERR: u16 = 0x6AF8;
 }
 
 /// An expected, surfaced-to-user applet error.
@@ -71,6 +104,16 @@ pub enum OtpError {
     ButtonPressRequired,
     /// `6A86` — this model does not expose HOTP-over-HID.
     HidNotSupported,
+    /// `6A81` — command not allowed in the current PIN state.
+    NotAllowedInState,
+    /// `6982` — PIN not verified, or the wrong PIN was supplied.
+    PinNotVerified,
+    /// `6983` — PIN is locked out after too many wrong attempts.
+    PinBlocked,
+    /// The OTP-PIN command set is not implemented by this key's firmware
+    /// (privacy protection needs R3.4 / manual V1.2). Seen as `6A86` / `6AF8`
+    /// on the PIN commands.
+    PinUnsupported(u16),
     /// Any other non-`9000` status word.
     BadStatusCode(u16),
 }
@@ -84,6 +127,27 @@ impl OtpError {
             sw::NOT_ENOUGH_SPACE => Err(OtpError::NotEnoughSpace),
             sw::BUTTON_TIMEOUT => Err(OtpError::ButtonPressRequired),
             sw::HID_NOT_SUPPORTED => Err(OtpError::HidNotSupported),
+            sw::NOT_ALLOWED => Err(OtpError::NotAllowedInState),
+            sw::SECURITY_NOT_SATISFIED => Err(OtpError::PinNotVerified),
+            sw::PIN_BLOCKED => Err(OtpError::PinBlocked),
+            other => Err(OtpError::BadStatusCode(other)),
+        }
+    }
+
+        /// Map a status word for an OTP-PIN command, translating the
+    /// not-implemented codes (`6A86` / `6AF8`) into [`OtpError::PinUnsupported`]
+    /// so callers get an accurate message instead of the generic HID one.
+    pub fn check_pin(sw: u16) -> Result<(), OtpError> {
+        match sw {
+            sw::OK => Ok(()),
+            // 6A86 on the *session* command has been observed only on older
+            // keys that lack the feature entirely; on a PIN-capable key the
+            // handshake returns 9000. We surface it as "unsupported" but note
+            // the SW so it is never confused with a framing bug.
+            sw::WRONG_P1P2 => Err(OtpError::PinUnsupported(sw)),
+            sw::NOT_ALLOWED => Err(OtpError::NotAllowedInState),
+            sw::SECURITY_NOT_SATISFIED => Err(OtpError::PinNotVerified),
+            sw::PIN_BLOCKED => Err(OtpError::PinBlocked),
             other => Err(OtpError::BadStatusCode(other)),
         }
     }
@@ -103,6 +167,19 @@ impl std::fmt::Display for OtpError {
                 write!(f, "timed out waiting for a button press on the key")
             }
             OtpError::HidNotSupported => write!(f, "HOTP-over-HID is not supported on this model"),
+            OtpError::NotAllowedInState => {
+                write!(f, "command not allowed in the current PIN state")
+            }
+            OtpError::PinNotVerified => write!(f, "OTP PIN not verified or incorrect"),
+            OtpError::PinBlocked => {
+                write!(f, "OTP PIN is locked out; erase-all is the only recovery")
+            }
+            OtpError::PinUnsupported(sw) => write!(
+                f,
+                "this key's firmware does not support the OTP PIN (privacy-protection) \
+                 feature — it needs R3.4 / OTP-manual V1.2 (device replied {:#06X})",
+                sw
+            ),
             OtpError::BadStatusCode(sw) => write!(f, "unexpected status word {:#06X}", sw),
         }
     }
@@ -178,6 +255,152 @@ pub fn serialize_enum_all(timestamp: u64) -> Vec<u8> {
     buf.push(cmd::SUB_READ_ALL);
     buf.extend_from_slice(&timestamp.to_be_bytes());
     buf
+}
+
+// --- OTP PIN (privacy protection) --------------------------------------------
+
+/// Build a `READ_OTP_PIN_FLAG` request for the given short-form `Lc`. Use
+/// [`cmd::PIN_FLAG_LC_BASE`] for status only, or [`cmd::PIN_FLAG_LC_CHALLENGE`]
+/// to also fetch the `IV || EncRand` verify challenge.
+pub fn read_otp_pin_flag(len: u8) -> Vec<u8> {
+    // The flag read is a short-Lc command that carries a body: `CLA INS P1 P2
+    // len || len*0x00`. The applet reads `len` (04/09/29), overwrites the
+    // placeholder body, and returns `len` bytes of PIN-flag data (chaining via
+    // 61xx). A bodyless read in any form is rejected with the proprietary 6AF8;
+    // confirmed by device probing against R3.4 firmware.
+    let mut v = cmd::READ_OTP_PIN_FLAG.to_vec();
+    v.push(len);
+    v.extend(std::iter::repeat(0x00).take(len as usize));
+    v
+}
+
+/// Build the OTP-PIN **lock** request: it shares the `VERIFY_OTP_PIN` header
+/// (`80 C5 05 06`) but is distinguished from a verify by its body — a single
+/// `0x00` byte, sent with short-form Lc. The applet closes the read/write window
+/// immediately (the same window a verify opens for ~5 minutes). Matches the
+/// Token2 reference client's `lock()`.
+pub fn lock_otp_pin() -> Vec<u8> {
+    let mut v = cmd::VERIFY_OTP_PIN.to_vec();
+    v.push(0x01); // short Lc = 1
+    v.push(0x00); // body
+    v
+}
+
+/// Build the `READ_AGREEMENT_PUBKEY` request. `host_pub_xy` is the host's
+/// ephemeral P-256 public key as raw `X || Y` (64 bytes, no `0x04`).
+pub fn read_agreement_pubkey(host_pub_xy: &[u8]) -> Vec<u8> {
+    build_apdu(cmd::READ_AGREEMENT_PUBKEY, host_pub_xy)
+}
+
+/// Decoded fixed head of a `READ_OTP_PIN_FLAG` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinFlag {
+    pub alg_id: u8,
+    pub retries_left: u8,
+    pub pin_len: u8,
+    pub max_retries: u8,
+    /// Present only on the `Lc = 0x29` read: the verify challenge
+    /// (`IV(16) || EncRand(16)`), still encrypted under the session key.
+    pub challenge: Option<([u8; 16], [u8; 16])>,
+}
+
+impl PinFlag {
+    /// A PIN is set iff the reported PIN length is non-zero.
+    pub fn is_set(&self) -> bool {
+        self.pin_len != 0
+    }
+
+    /// Parse the response. Layout matches the Token2 reference client:
+    /// `AlgId(1) Retry(1) PinLen(1) MaxRetry(1) FpEnable(1) PubVer(2) PubCrc(2)`
+    /// then, on the `Lc=0x29` read, `IV(16) EncRand(16)` starting at offset 9.
+    pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
+        if data.len() < 4 {
+            return Err(ParseError::Truncated);
+        }
+        let challenge = if data.len() >= 41 {
+            let mut iv = [0u8; 16];
+            let mut enc = [0u8; 16];
+            iv.copy_from_slice(&data[9..25]);
+            enc.copy_from_slice(&data[25..41]);
+            Some((iv, enc))
+        } else {
+            None
+        };
+        Ok(PinFlag {
+            alg_id: data[0],
+            retries_left: data[1],
+            pin_len: data[2],
+            max_retries: data[3],
+            challenge,
+        })
+    }
+}
+
+/// Enforce the client-side OTP-PIN policy (protocol doc §9). Mirrors the rules
+/// the firmware rejects with `6A80`, surfaced here as a clear message before we
+/// hit the wire. Returns the PIN's byte length on success.
+pub fn validate_otp_pin(pin: &str) -> Result<u8, &'static str> {
+    let bytes = pin.as_bytes();
+    if bytes.len() > 255 {
+        return Err("PIN is too long");
+    }
+    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
+    if all_digits {
+        validate_numeric_pin(bytes)?;
+    } else {
+        validate_alphanumeric_pin(pin)?;
+    }
+    Ok(bytes.len() as u8)
+}
+
+fn validate_numeric_pin(b: &[u8]) -> Result<(), &'static str> {
+    if b.len() < 6 {
+        return Err("numeric PIN must be at least 6 digits");
+    }
+    // all-identical
+    if b.iter().all(|&c| c == b[0]) {
+        return Err("numeric PIN must not be all the same digit");
+    }
+    // ascending / descending runs across the whole PIN
+    let asc = b.windows(2).all(|w| w[1] == w[0] + 1);
+    let desc = b.windows(2).all(|w| w[0] == w[1] + 1);
+    if asc || desc {
+        return Err("numeric PIN must not be a simple ascending/descending sequence");
+    }
+    // palindrome
+    if b.iter().eq(b.iter().rev()) {
+        return Err("numeric PIN must not be a palindrome");
+    }
+    // any single digit repeating more than 3 times total
+    for d in b'0'..=b'9' {
+        if b.iter().filter(|&&c| c == d).count() > 3 {
+            return Err("numeric PIN repeats a single digit too many times");
+        }
+    }
+    Ok(())
+}
+
+fn validate_alphanumeric_pin(pin: &str) -> Result<(), &'static str> {
+    if pin.chars().count() < 10 {
+        return Err("alphanumeric PIN must be at least 10 characters");
+    }
+    let mut classes = 0;
+    if pin.chars().any(|c| c.is_ascii_uppercase()) {
+        classes += 1;
+    }
+    if pin.chars().any(|c| c.is_ascii_lowercase()) {
+        classes += 1;
+    }
+    if pin.chars().any(|c| c.is_ascii_digit()) {
+        classes += 1;
+    }
+    if pin.chars().any(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace()) {
+        classes += 1;
+    }
+    if classes < 2 {
+        return Err("alphanumeric PIN must mix at least two of: upper, lower, digit, symbol");
+    }
+    Ok(())
 }
 
 // --- serial parsing -----------------------------------------------------------
@@ -390,6 +613,12 @@ mod tests {
     }
 
     #[test]
+    fn lock_is_verify_header_with_zero_body() {
+        // Lock shares the VERIFY header (80 C5 05 06), short Lc=1, body 0x00.
+        assert_eq!(lock_otp_pin(), vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x00]);
+    }
+
+    #[test]
     fn select_uses_short_lc() {
         assert_eq!(
             build_select(&OTP_APPLET_AID),
@@ -406,6 +635,24 @@ mod tests {
     }
 
     #[test]
+    fn pin_status_words_map_to_unsupported() {
+        // On the PIN commands, 6A86 and 6AF8 mean "firmware lacks the feature".
+        assert_eq!(OtpError::check_pin(0x9000), Ok(()));
+        assert!(matches!(
+            OtpError::check_pin(0x6A86),
+            Err(OtpError::PinUnsupported(0x6A86))
+        ));
+        // 6AF8 is a parameter/framing error, not "unsupported".
+        assert!(matches!(
+            OtpError::check_pin(0x6AF8),
+            Err(OtpError::BadStatusCode(0x6AF8))
+        ));
+        assert_eq!(OtpError::check_pin(0x6982), Err(OtpError::PinNotVerified));
+        // But the *generic* check still treats 6A86 as the HID message.
+        assert_eq!(OtpError::check(0x6A86), Err(OtpError::HidNotSupported));
+    }
+
+    #[test]
     fn serial_double_decode() {
         let resp = [
             0xD1, 0x0A, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0',
@@ -417,6 +664,58 @@ mod tests {
     fn base32_seed_decodes_hello() {
         assert_eq!(&decode_base32_seed("JBSWY3DP").unwrap()[..], b"Hello");
         assert_eq!(&decode_base32_seed("jbswy3dp").unwrap()[..], b"Hello");
+    }
+
+    #[test]
+    fn pin_flag_parses_base_and_challenge() {
+        // base (Lc=04): alg, retries, len, max
+        let base = [0x07, 0x05, 0x06, 0x0A];
+        let f = PinFlag::parse(&base).unwrap();
+        assert!(f.is_set());
+        assert_eq!(f.pin_len, 6);
+        assert_eq!(f.retries_left, 5);
+        assert!(f.challenge.is_none());
+
+        // unset device
+        let unset = [0x00, 0x00, 0x00, 0x0A];
+        assert!(!PinFlag::parse(&unset).unwrap().is_set());
+
+        // challenge (Lc=0x29): base(4) + fp(1) + pubver(2) + pubcrc(2) + IV(16) + EncRand(16)
+        let mut chal = vec![0x07, 0x05, 0x06, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x22];
+        chal.extend_from_slice(&[0xAA; 16]);
+        chal.extend_from_slice(&[0xBB; 16]);
+        let f = PinFlag::parse(&chal).unwrap();
+        let (iv, enc) = f.challenge.unwrap();
+        assert_eq!(iv, [0xAA; 16]);
+        assert_eq!(enc, [0xBB; 16]);
+    }
+
+    #[test]
+    fn otp_pin_policy() {
+        // good numeric
+        assert!(validate_otp_pin("135790").is_ok());
+        // too short
+        assert!(validate_otp_pin("12345").is_err());
+        // ascending / all-same / palindrome / over-repeat
+        assert!(validate_otp_pin("123456").is_err());
+        assert!(validate_otp_pin("111111").is_err());
+        assert!(validate_otp_pin("321123").is_err());
+        assert!(validate_otp_pin("111123").is_err());
+        // alphanumeric: needs >=10 and two classes
+        assert!(validate_otp_pin("abcdefghij").is_err()); // one class
+        assert!(validate_otp_pin("Abcdefghi9").is_ok());
+        assert!(validate_otp_pin("short1A").is_err());
+    }
+
+    #[test]
+    fn pin_flag_apdu_forms() {
+        // Extended-length case-2: CLA INS P1 P2 00 00 Le.
+        assert_eq!(
+            read_otp_pin_flag(0x04),
+            vec![0x80, 0xC5, 0x05, 0x04, 0x04, 0, 0, 0, 0]
+        );
+        // short Lc + `len` body bytes => 5 header/Lc bytes + len body bytes
+        assert_eq!(read_otp_pin_flag(0x29).len(), 5 + 0x29);
     }
 
     #[test]

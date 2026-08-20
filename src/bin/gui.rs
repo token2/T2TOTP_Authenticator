@@ -24,7 +24,7 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke};
 use t2totp::entry::{Algorithm, OtpType, WriteEntry};
 use t2totp::transport::{Interface, OtpSession};
 use t2totp::AUTO_TAG;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "hotkey")]
 #[path = "../gui/hotkey.rs"]
@@ -127,6 +127,14 @@ enum JobResult {
     },
     /// A quiet background refresh found the key gone; clear the list.
     Disconnected,
+    /// Load/refresh hit a PIN-protected key with no (or wrong) PIN supplied.
+    /// The UI opens the PIN prompt in response. `wrong` distinguishes a bad
+    /// PIN retry from the first prompt.
+    PinRequired { wrong: bool },
+    /// PIN status read (whether set + retries remaining).
+    PinStatus { set: bool, retries: u8, max: u8 },
+    /// A keep-unlocked keep-alive re-verify succeeded (no UI change needed).
+    PinKeptAlive,
     TouchCode {
         key: (String, String),
         code: String,
@@ -179,7 +187,7 @@ fn algo_str(a: Algorithm) -> &'static str {
 }
 
 /// Load every entry + serial. Runs on the worker thread.
-fn job_load(t: Transport) -> JobResult {
+fn job_load(t: Transport, pin: Option<Zeroizing<String>>) -> JobResult {
     let mut session = match open(t) {
         Ok(s) => s,
         Err(e) => return JobResult::Err(e),
@@ -189,7 +197,7 @@ fn job_load(t: Transport) -> JobResult {
         .cached_serial()
         .map(|s| t2totp::proto::hex(s))
         .or_else(|| session.read_serial().ok().map(|s| t2totp::proto::hex(&s)));
-    match session.enumerate(now_secs()) {
+    match session.enumerate_pinned(now_secs(), pin.as_deref().map(|z| z.as_str())) {
         Ok(entries) => {
             let rows = entries
                 .into_iter()
@@ -209,6 +217,10 @@ fn job_load(t: Transport) -> JobResult {
                 transport: if is_pcsc { "NFC / PC-SC" } else { "USB-HID" },
             }
         }
+        Err(t2totp::transport::Error::PinRequired) => JobResult::PinRequired { wrong: false },
+        Err(t2totp::transport::Error::Applet(t2totp::proto::OtpError::PinNotVerified)) => {
+            JobResult::PinRequired { wrong: true }
+        }
         Err(e) => JobResult::Err(e.to_string()),
     }
 }
@@ -216,7 +228,7 @@ fn job_load(t: Transport) -> JobResult {
 /// Quiet background refresh: re-read entries to update codes and detect unplug.
 /// Returns `Disconnected` when the key is no longer reachable, so the UI can
 /// clear stale codes instead of showing codes for an absent device.
-fn job_refresh(t: Transport) -> JobResult {
+fn job_refresh(t: Transport, pin: Option<Zeroizing<String>>) -> JobResult {
     let mut session = match open(t) {
         Ok(s) => s,
         // Any failure to open the session is treated as "device gone" for the
@@ -228,7 +240,7 @@ fn job_refresh(t: Transport) -> JobResult {
         .cached_serial()
         .map(|s| t2totp::proto::hex(s))
         .or_else(|| session.read_serial().ok().map(|s| t2totp::proto::hex(&s)));
-    match session.enumerate(now_secs()) {
+    match session.enumerate_pinned(now_secs(), pin.as_deref().map(|z| z.as_str())) {
         Ok(entries) => {
             let rows = entries
                 .into_iter()
@@ -250,6 +262,83 @@ fn job_refresh(t: Transport) -> JobResult {
         }
         // Enumerate failed mid-session — the key was likely removed.
         Err(_) => JobResult::Disconnected,
+    }
+}
+
+fn job_pin_status(t: Transport) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(e) => return JobResult::Err(e),
+    };
+    match s.pin_status() {
+        Ok(f) => JobResult::PinStatus {
+            set: f.is_set(),
+            retries: f.retries_left,
+            max: f.max_retries,
+        },
+        Err(e) => JobResult::Err(e.to_string()),
+    }
+}
+
+fn job_pin_set(t: Transport, pin: Zeroizing<String>) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(e) => return JobResult::Err(e),
+    };
+    match s.set_pin(&pin) {
+        Ok(()) => JobResult::Ok("OTP PIN set.".into()),
+        Err(e) => JobResult::Err(e.to_string()),
+    }
+}
+
+fn job_pin_change(t: Transport, cur: Zeroizing<String>, new: Zeroizing<String>) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(e) => return JobResult::Err(e),
+    };
+    match s.change_pin(&cur, &new) {
+        Ok(()) => JobResult::Ok("OTP PIN changed.".into()),
+        Err(e) => JobResult::Err(e.to_string()),
+    }
+}
+
+fn job_pin_remove(t: Transport, cur: Zeroizing<String>) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(e) => return JobResult::Err(e),
+    };
+    match s.remove_pin(&cur) {
+        Ok(()) => JobResult::Ok("OTP PIN removed.".into()),
+        Err(e) => JobResult::Err(e.to_string()),
+    }
+}
+
+fn job_pin_lock(t: Transport) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(e) => return JobResult::Err(e),
+    };
+    match s.lock_pin() {
+        Ok(()) => JobResult::Ok("OTP PIN window locked.".into()),
+        Err(e) => JobResult::Err(e.to_string()),
+    }
+}
+
+/// Keep-unlocked keep-alive: re-verify with the cached PIN to refresh the window
+/// before the device's ~5-minute timeout. Quiet — reports Refreshed-style status
+/// only via PinRequired on failure (so the UI can re-prompt).
+fn job_pin_keepalive(t: Transport, pin: Zeroizing<String>) -> JobResult {
+    let mut s = match open(t) {
+        Ok(s) => s,
+        Err(_) => return JobResult::Disconnected,
+    };
+    match s.reverify_pin(&pin) {
+        Ok(()) => JobResult::PinKeptAlive,
+        Err(t2totp::transport::Error::Applet(t2totp::proto::OtpError::PinNotVerified)) => {
+            JobResult::PinRequired { wrong: true }
+        }
+        Err(t2totp::transport::Error::PinNotSet) => JobResult::PinKeptAlive,
+        Err(e) => JobResult::Err(e.to_string()),
     }
 }
 
@@ -300,6 +389,40 @@ impl Drop for AddForm {
     }
 }
 
+/// State for the PIN prompt (verify to unlock reads) and the PIN-management
+/// section in Settings.
+#[derive(Default)]
+struct PinUi {
+    /// The unlock prompt is open (key is PIN-protected and not yet verified).
+    prompt_open: bool,
+    /// Text in the unlock prompt.
+    entry: String,
+    /// The last unlock attempt was rejected.
+    wrong: bool,
+    /// Whether the key currently has a PIN (from a status read); None = unknown.
+    is_set: Option<bool>,
+    retries: u8,
+    max: u8,
+    // --- management (Settings) fields ---
+    mgmt_open: bool,
+    set_new: String,
+    set_confirm: String,
+    change_cur: String,
+    change_new: String,
+    remove_cur: String,
+}
+
+impl Drop for PinUi {
+    fn drop(&mut self) {
+        self.entry.zeroize();
+        self.set_new.zeroize();
+        self.set_confirm.zeroize();
+        self.change_cur.zeroize();
+        self.change_new.zeroize();
+        self.remove_cur.zeroize();
+    }
+}
+
 struct App {
     p: Palette,
     /// The app icon as an egui texture for the header badge (loaded once).
@@ -329,6 +452,15 @@ struct App {
     settings_open: bool,
     touch_codes: std::collections::HashMap<(String, String), String>,
     clipboard_clear_at: Option<(String, f64)>,
+    /// A verified OTP PIN, kept for the session so background refreshes can
+    /// re-open the read window. Cleared when the key is unplugged or on exit.
+    pin: Option<Zeroizing<String>>,
+    pin_ui: PinUi,
+    /// When true, keep the PIN window open all session by re-verifying with the
+    /// cached PIN before the device's ~5-minute timeout. Persisted.
+    keep_unlocked: bool,
+    /// Epoch seconds for the next keep-unlocked re-verify (0 = none scheduled).
+    next_pin_refresh_at: f64,
     // job plumbing
     tx: Sender<JobResult>,
     rx: Receiver<JobResult>,
@@ -382,6 +514,10 @@ impl App {
             settings_open: false,
             touch_codes: std::collections::HashMap::new(),
             clipboard_clear_at: None,
+            pin: None,
+            pin_ui: PinUi::default(),
+            keep_unlocked: saved.keep_unlocked,
+            next_pin_refresh_at: 0.0,
             tx,
             rx,
             clipboard,
@@ -432,7 +568,8 @@ impl App {
         self.loaded = false;
         self.touch_codes.clear();
         let t = self.transport;
-        self.spawn("Reading entries…", None, move || job_load(t));
+        let pin = self.pin.clone();
+        self.spawn("Reading entries…", None, move || job_load(t, pin));
     }
 
     /// Schedule the next automatic refresh. We refresh shortly after the
@@ -459,6 +596,50 @@ impl App {
         self.next_refresh_at = now + interval;
     }
 
+    /// Lock the PIN window now: drop the cached PIN, cancel the keep-alive, and
+    /// close the window on the device. After this the entry list is hidden until
+    /// the user unlocks again. Shared by the toolbar Lock button and the "Lock
+    /// now" control in Manage OTP PIN.
+    fn lock_now(&mut self, ctx: &egui::Context) {
+        if let Some(mut pp) = self.pin.take() {
+            pp.zeroize();
+        }
+        self.next_pin_refresh_at = 0.0;
+        // Hide entries immediately; the reload after locking will re-fetch and
+        // land back on the PIN prompt.
+        self.rows.clear();
+        let t = self.transport;
+        self.spawn_pin("Locking…", ctx, move || job_pin_lock(t));
+    }
+
+    /// Schedule the next keep-unlocked re-verify (~4 min; the device window is
+    /// ~5 min, so this refreshes comfortably before it closes).
+    fn schedule_next_pin_refresh(&mut self) {
+        if self.keep_unlocked && self.pin.is_some() {
+            self.next_pin_refresh_at = now_secs_f64() + 240.0;
+        } else {
+            self.next_pin_refresh_at = 0.0;
+        }
+    }
+
+    /// Fire a quiet keep-alive re-verify using the cached PIN.
+    fn pin_keepalive(&mut self, ctx: &egui::Context) {
+        let Some(pin) = self.pin.clone() else {
+            self.next_pin_refresh_at = 0.0;
+            return;
+        };
+        let t = self.transport;
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        // Reschedule immediately so we don't spam if the job is slow.
+        self.next_pin_refresh_at = now_secs_f64() + 240.0;
+        std::thread::spawn(move || {
+            let result = job_pin_keepalive(t, pin);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
     /// Kick off a quiet background refresh (keeps showing current rows).
     fn refresh_codes(&mut self, ctx: &egui::Context) {
         if self.refreshing || !self.loaded {
@@ -466,10 +647,11 @@ impl App {
         }
         self.refreshing = true;
         let t = self.transport;
+        let pin = self.pin.clone();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = job_refresh(t);
+            let result = job_refresh(t, pin);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -487,6 +669,7 @@ impl App {
                 }
                 .to_string(),
             ),
+            keep_unlocked: self.keep_unlocked,
             ..Default::default()
         };
         #[cfg(feature = "hotkey")]
@@ -623,8 +806,13 @@ impl App {
                     self.schedule_next_refresh();
                 }
                 JobResult::Disconnected => {
-                    // Key removed (or unreadable): clear stale codes.
+                    // Key removed (or unreadable): clear stale codes and any
+                    // cached PIN / keep-alive (the window is gone with the key).
                     self.refreshing = false;
+                    self.next_pin_refresh_at = 0.0;
+                    if let Some(mut pp) = self.pin.take() {
+                        pp.zeroize();
+                    }
                     if !self.rows.is_empty() || self.serial.is_some() {
                         self.rows.clear();
                         self.serial = None;
@@ -638,8 +826,38 @@ impl App {
                     self.touch_codes.insert(key, code);
                 }
                 JobResult::Ok(msg) => {
-                    self.set_info(msg);
+                    if !msg.is_empty() {
+                        self.set_info(msg);
+                    }
                     self.reload();
+                }
+                JobResult::PinRequired { wrong } => {
+                    // Key is PIN-protected and locked: stop the "reading" state,
+                    // hide any codes, and prompt to unlock.
+                    self.refreshing = false;
+                    self.loaded = true;
+                    self.next_pin_refresh_at = 0.0;
+                    self.rows.clear();
+                    self.touch_codes.clear();
+                    if wrong {
+                        // A stored PIN was rejected — drop it and re-prompt.
+                        if let Some(mut p) = self.pin.take() {
+                            p.zeroize();
+                        }
+                    }
+                    self.pin_ui.wrong = wrong;
+                    self.pin_ui.prompt_open = true;
+                    self.schedule_next_refresh();
+                }
+                JobResult::PinStatus { set, retries, max } => {
+                    self.pin_ui.is_set = Some(set);
+                    self.pin_ui.retries = retries;
+                    self.pin_ui.max = max;
+                    self.refreshing = false;
+                }
+                JobResult::PinKeptAlive => {
+                    // Window refreshed silently; schedule the next keep-alive.
+                    self.schedule_next_pin_refresh();
                 }
                 JobResult::Err(msg) => {
                     self.error = Some(msg);
@@ -723,6 +941,16 @@ impl eframe::App for App {
         {
             self.refresh_codes(ctx);
         }
+        // Keep-unlocked keep-alive: re-verify with the cached PIN before the
+        // device's ~5-minute window closes.
+        if self.keep_unlocked
+            && self.pin.is_some()
+            && self.busy.is_none()
+            && self.next_pin_refresh_at > 0.0
+            && now_secs_f64() >= self.next_pin_refresh_at
+        {
+            self.pin_keepalive(ctx);
+        }
         #[cfg(feature = "hotkey")]
         self.poll_hotkey();
         apply_style(ctx, &self.p);
@@ -754,6 +982,8 @@ impl eframe::App for App {
         self.settings_dialog(ctx);
         self.erase_dialog(ctx);
         self.exit_dialog(ctx);
+        self.pin_dialog(ctx);
+        self.pin_mgmt_dialog(ctx);
 
         // Keep TOTP countdowns ticking and clipboard-clear timely.
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -833,6 +1063,18 @@ impl App {
                 ui.add_space(6.0);
                 if icon_button(ui, &self.p, "⚙").on_hover_text("Settings").clicked() {
                     self.settings_open = true;
+                }
+
+                // Lock button: only while a PIN-protected key is currently
+                // unlocked (a PIN is cached). Closes the window and hides codes.
+                if self.pin.is_some() {
+                    ui.add_space(6.0);
+                    if icon_button(ui, &self.p, "\u{1F512}")
+                        .on_hover_text("Lock OTP PIN (hide codes)")
+                        .clicked()
+                    {
+                        self.lock_now(ui.ctx());
+                    }
                 }
 
                 // Small Auto-OTP toggle: icon only, accent when active. The full
@@ -1039,12 +1281,23 @@ impl App {
             let t = self.transport;
             let (a, acct) = key.clone();
             let ctx2 = ctx.clone();
+            let pin = self.pin.clone();
             self.spawn("Touch your key to read the code…", Some(ctx.clone()), move || {
                 let mut session = match open(t) {
                     Ok(s) => s,
                     Err(e) => return JobResult::Err(e),
                 };
                 let _ = &ctx2;
+                match session.unlock_if_pinned(pin.as_deref().map(|z| z.as_str())) {
+                    Ok(()) => {}
+                    Err(t2totp::transport::Error::PinRequired) => {
+                        return JobResult::PinRequired { wrong: false }
+                    }
+                    Err(t2totp::transport::Error::Applet(
+                        t2totp::proto::OtpError::PinNotVerified,
+                    )) => return JobResult::PinRequired { wrong: true },
+                    Err(e) => return JobResult::Err(e.to_string()),
+                }
                 match session.read_entry(now_secs(), &a, &acct) {
                     Ok(entry) => match entry.code {
                         Some(code) => JobResult::TouchCode { key, code },
@@ -1187,6 +1440,7 @@ impl App {
         let t = self.transport;
 
         self.add.open = false;
+        let pin = self.pin.clone();
         self.spawn("Adding profile…", Some(ctx), move || {
             let seed = match t2totp::proto::decode_base32_seed(&secret) {
                 Ok(s) => s,
@@ -1206,8 +1460,17 @@ impl App {
                 account_name: &account,
                 seed: &seed,
             };
-            match session.write_entry(&entry) {
+            // On a PIN-protected key, verify first: this opens the write window
+            // and captures the agreement pubkey the seal reuses (GET_ECDH_PUBKEY
+            // is blocked while a PIN is set).
+            match session.write_entry_pinned(&entry, pin.as_deref().map(|z| z.as_str())) {
                 Ok(()) => JobResult::Ok(format!("Added {issuer}:{account}")),
+                Err(t2totp::transport::Error::PinRequired) => {
+                    JobResult::PinRequired { wrong: false }
+                }
+                Err(t2totp::transport::Error::Applet(
+                    t2totp::proto::OtpError::PinNotVerified,
+                )) => JobResult::PinRequired { wrong: true },
                 Err(e) => JobResult::Err(e.to_string()),
             }
         });
@@ -1247,13 +1510,27 @@ impl App {
             Some(true) => {
                 self.confirm_delete = None;
                 let t = self.transport;
+                let pin = self.pin.clone();
                 self.spawn("Deleting…", Some(ctx.clone()), move || {
                     let mut session = match open(t) {
                         Ok(s) => s,
                         Err(e) => return JobResult::Err(e),
                     };
-                    match session.delete_entry(&app_name, &account) {
+                    // Delete is a seed-write; on a PIN-protected key verify first
+                    // (opens the window + captures the agreement pubkey the seal
+                    // reuses, since GET_ECDH_PUBKEY is blocked while a PIN is set).
+                    match session.delete_entry_pinned(
+                        &app_name,
+                        &account,
+                        pin.as_deref().map(|z| z.as_str()),
+                    ) {
                         Ok(()) => JobResult::Ok("Deleted.".into()),
+                        Err(t2totp::transport::Error::PinRequired) => {
+                            JobResult::PinRequired { wrong: false }
+                        }
+                        Err(t2totp::transport::Error::Applet(
+                            t2totp::proto::OtpError::PinNotVerified,
+                        )) => JobResult::PinRequired { wrong: true },
                         Err(e) => JobResult::Err(e.to_string()),
                     }
                 });
@@ -1275,6 +1552,7 @@ impl App {
         #[cfg(feature = "hotkey")]
         let mut close_clicked = false;
         let mut start_erase = false;
+        let mut open_pin_mgmt = false;
 
         egui::Window::new("Settings")
             .title_bar(false)
@@ -1405,6 +1683,29 @@ impl App {
                     ui.add_space(10.0);
                 }
 
+                // OTP PIN (privacy protection).
+                ui.label(
+                    RichText::new("OTP PIN (privacy protection)")
+                        .font(prop(13.5))
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        "Require a PIN before OTP codes can be read from this key \
+                         (needs R3.4 firmware).",
+                    )
+                    .font(prop(11.0))
+                    .color(self.p.txt3),
+                );
+                ui.add_space(8.0);
+                if accent_button(ui, &self.p, "Manage OTP PIN…").clicked() {
+                    open_pin_mgmt = true;
+                }
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
                 // Danger zone.
                 ui.label(RichText::new("Danger zone").font(prop(13.5)).strong().color(self.p.err));
                 ui.add_space(2.0);
@@ -1450,6 +1751,12 @@ impl App {
         if start_erase {
             self.settings_open = false;
             self.confirm_erase = true;
+        }
+        if open_pin_mgmt {
+            self.settings_open = false;
+            self.pin_ui.mgmt_open = true;
+            self.pin_ui.is_set = None;
+            self.refresh_pin_status(ctx);
         }
     }
 
@@ -1551,6 +1858,295 @@ impl App {
             None => {}
         }
     }
+
+    /// Spawn a PIN-management job (status/set/change/remove) on the worker.
+    fn spawn_pin<F>(&mut self, busy: &str, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce() -> JobResult + Send + 'static,
+    {
+        self.spawn(busy, Some(ctx.clone()), f);
+    }
+
+    /// Kick off a PIN status read (used to populate the management section).
+    fn refresh_pin_status(&mut self, ctx: &egui::Context) {
+        let t = self.transport;
+        self.spawn_pin("Reading PIN status…", ctx, move || job_pin_status(t));
+    }
+
+    /// The unlock prompt: shown when the key is PIN-protected and we don't yet
+    /// have a verified PIN. Entering the correct PIN reloads with reads unlocked.
+    fn pin_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pin_ui.prompt_open {
+            return;
+        }
+        let mut submit = false;
+        let mut cancel = false;
+        let (keep_open, _) = modal(ctx, &self.p, "pin_dialog", "Enter OTP PIN", 340.0, |ui| {
+            ui.label(
+                RichText::new("This key is protected by an OTP PIN.")
+                    .font(prop(12.5))
+                    .color(self.p.txt),
+            );
+            ui.add_space(8.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.pin_ui.entry)
+                    .password(true)
+                    .hint_text("OTP PIN")
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            if self.pin_ui.wrong {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Incorrect PIN — try again.")
+                        .font(prop(11.5))
+                        .color(self.p.err),
+                );
+            }
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if accent_button(ui, &self.p, "Unlock").clicked() {
+                    submit = true;
+                }
+                ui.add_space(8.0);
+                if plain_button(ui, &self.p, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if !keep_open {
+            cancel = true;
+        }
+        if submit && !self.pin_ui.entry.trim().is_empty() {
+            let pin = Zeroizing::new(self.pin_ui.entry.trim().to_string());
+            self.pin_ui.entry.zeroize();
+            self.pin_ui.entry.clear();
+            self.pin_ui.prompt_open = false;
+            self.pin_ui.wrong = false;
+            self.pin = Some(pin);
+            self.schedule_next_pin_refresh();
+            self.reload();
+        } else if cancel {
+            self.pin_ui.entry.zeroize();
+            self.pin_ui.entry.clear();
+            self.pin_ui.prompt_open = false;
+        }
+    }
+
+    /// PIN management modal: status + set / change / remove. Opened from Settings.
+    fn pin_mgmt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pin_ui.mgmt_open {
+            return;
+        }
+        let mut action: Option<PinAction> = None;
+        let mut close = false;
+        let mut lock_now = false;
+        let is_set = self.pin_ui.is_set;
+        let has_cached_pin = self.pin.is_some();
+        let mut keep_unlocked = self.keep_unlocked;
+        let (keep_open, _) =
+            modal(ctx, &self.p, "pin_mgmt_dialog", "OTP PIN (privacy protection)", 380.0, |ui| {
+                match is_set {
+                    Some(true) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "PIN is set — {} of {} attempts remaining.",
+                                self.pin_ui.retries, self.pin_ui.max
+                            ))
+                            .font(prop(12.0))
+                            .color(self.p.txt),
+                        );
+                    }
+                    Some(false) => {
+                        ui.label(
+                            RichText::new("No PIN is set on this key.")
+                                .font(prop(12.0))
+                                .color(self.p.txt),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("Reading PIN status…")
+                                .font(prop(12.0))
+                                .color(self.p.txt3),
+                        );
+                    }
+                }
+                ui.add_space(10.0);
+
+                if is_set == Some(false) {
+                    ui.label(RichText::new("Set a PIN").font(prop(12.5)).strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pin_ui.set_new)
+                            .password(true)
+                            .hint_text("New PIN (≥6 digits, or ≥10 chars)")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pin_ui.set_confirm)
+                            .password(true)
+                            .hint_text("Confirm new PIN")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if accent_button(ui, &self.p, "Set PIN").clicked() {
+                            action = Some(PinAction::Set);
+                        }
+                    });
+                }
+
+                if is_set == Some(true) {
+                    ui.label(RichText::new("Change PIN").font(prop(12.5)).strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pin_ui.change_cur)
+                            .password(true)
+                            .hint_text("Current PIN")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pin_ui.change_new)
+                            .password(true)
+                            .hint_text("New PIN")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if accent_button(ui, &self.p, "Change PIN").clicked() {
+                            action = Some(PinAction::Change);
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Remove PIN").font(prop(12.5)).strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pin_ui.remove_cur)
+                            .password(true)
+                            .hint_text("Current PIN")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if danger_button(ui, &self.p, "Remove PIN").clicked() {
+                            action = Some(PinAction::Remove);
+                        }
+                    });
+                }
+
+                if is_set == Some(true) {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Session").font(prop(12.5)).strong());
+                    ui.add_space(2.0);
+                    ui.checkbox(
+                        &mut keep_unlocked,
+                        "Keep unlocked until I lock or unplug",
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Re-verifies with the PIN you entered before the key's \
+                             ~5-minute window closes. The PIN is held in memory only \
+                             for this session.",
+                        )
+                        .font(prop(10.5))
+                        .color(self.p.txt3),
+                    );
+                    if has_cached_pin {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if plain_button(ui, &self.p, "Lock now").clicked() {
+                                lock_now = true;
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if plain_button(ui, &self.p, "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        // Persist a keep-unlocked toggle change and (re)schedule the keep-alive.
+        if keep_unlocked != self.keep_unlocked {
+            self.keep_unlocked = keep_unlocked;
+            self.save_settings();
+            self.schedule_next_pin_refresh();
+        }
+        if lock_now {
+            self.lock_now(ctx);
+        }
+        if !keep_open {
+            close = true;
+        }
+        match action {
+            Some(PinAction::Set) => {
+                let new = self.pin_ui.set_new.trim().to_string();
+                let confirm = self.pin_ui.set_confirm.trim().to_string();
+                if new.is_empty() {
+                    self.error = Some("Enter a new PIN.".into());
+                } else if new != confirm {
+                    self.error = Some("PINs do not match.".into());
+                } else {
+                    let t = self.transport;
+                    let pin = Zeroizing::new(new);
+                    self.pin_ui.set_new.zeroize();
+                    self.pin_ui.set_confirm.zeroize();
+                    self.spawn_pin("Setting PIN…", ctx, move || job_pin_set(t, pin));
+                    self.pin_ui.is_set = None; // will re-read after
+                }
+            }
+            Some(PinAction::Change) => {
+                let cur = Zeroizing::new(self.pin_ui.change_cur.trim().to_string());
+                let new = Zeroizing::new(self.pin_ui.change_new.trim().to_string());
+                if cur.is_empty() || new.is_empty() {
+                    self.error = Some("Enter both the current and new PIN.".into());
+                } else {
+                    let t = self.transport;
+                    self.pin_ui.change_cur.zeroize();
+                    self.pin_ui.change_new.zeroize();
+                    self.spawn_pin("Changing PIN…", ctx, move || job_pin_change(t, cur, new));
+                    self.pin_ui.is_set = None;
+                }
+            }
+            Some(PinAction::Remove) => {
+                let cur = Zeroizing::new(self.pin_ui.remove_cur.trim().to_string());
+                if cur.is_empty() {
+                    self.error = Some("Enter the current PIN.".into());
+                } else {
+                    let t = self.transport;
+                    self.pin_ui.remove_cur.zeroize();
+                    // Removing the PIN also clears any cached verified PIN.
+                    if let Some(mut pp) = self.pin.take() {
+                        pp.zeroize();
+                    }
+                    self.spawn_pin("Removing PIN…", ctx, move || job_pin_remove(t, cur));
+                    self.pin_ui.is_set = None;
+                }
+            }
+            None => {}
+        }
+        if close {
+            self.pin_ui.mgmt_open = false;
+            self.pin_ui.set_new.zeroize();
+            self.pin_ui.set_confirm.zeroize();
+            self.pin_ui.change_cur.zeroize();
+            self.pin_ui.change_new.zeroize();
+            self.pin_ui.remove_cur.zeroize();
+        }
+    }
+}
+
+/// Which PIN-management action a click requested.
+enum PinAction {
+    Set,
+    Change,
+    Remove,
 }
 
 // ---------------------------------------------------------------------------

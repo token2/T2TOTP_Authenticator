@@ -15,6 +15,9 @@ use std::path::PathBuf;
 #[derive(Clone, Default)]
 pub struct Persisted {
     pub transport: Option<String>, // "auto" | "hid" | "nfc"
+    /// Keep the OTP-PIN read/write window open for the whole session by
+    /// re-verifying with the cached PIN before the device's ~5-minute timeout.
+    pub keep_unlocked: bool,
     #[cfg(feature = "hotkey")]
     pub hotkey_enabled: bool,
     #[cfg(feature = "hotkey")]
@@ -90,6 +93,10 @@ impl Persisted {
         if let Some(t) = map.get("transport") {
             out.transport = Some((*t).to_string());
         }
+        out.keep_unlocked = map
+            .get("keep_unlocked")
+            .map(|v| *v == "true")
+            .unwrap_or(false);
         #[cfg(feature = "hotkey")]
         {
             out.hotkey_enabled = b("hotkey_enabled");
@@ -118,6 +125,7 @@ impl Persisted {
         if let Some(t) = &self.transport {
             s.push_str(&format!("transport = {t}\n"));
         }
+        s.push_str(&format!("keep_unlocked = {}\n", self.keep_unlocked));
         #[cfg(feature = "hotkey")]
         {
             s.push_str(&format!("hotkey_enabled = {}\n", self.hotkey_enabled));

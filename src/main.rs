@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use t2totp::entry::{Algorithm, OtpType, WriteEntry};
 use t2totp::transport::{Error as TError, Interface, OtpSession, PcScTransport};
 use t2totp::{proto, AUTO_TAG};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -68,6 +68,7 @@ USAGE:
 GLOBAL OPTS:
     --transport <auto|hid|nfc>   Interface to use (default: auto)
     --reader <name>              Pin a specific PC/SC reader (serial-confirmed)
+    --pin                        Verify the OTP PIN first (read from $T2TOTP_PIN/stdin)
     --debug                      Trace device I/O on stderr
 
 COMMANDS:
@@ -83,11 +84,20 @@ COMMANDS:
                                    --touch           require a button press to emit the code
     delete <issuer> <account>    Delete a profile
     erase --yes                  Erase ALL profiles on the key
+    pin status                   Show OTP-PIN state (set?, retries left)
+    pin set                      Set an OTP PIN (privacy protection)
+    pin change                   Change the OTP PIN
+    pin remove                   Remove the OTP PIN
+    pin lock                     Close the PIN read/write window now
+                                   PINs are read from $T2TOTP_PIN or stdin, never argv
 
 Notes:
   * Token2 FIDO keys only; HOTP/other-vendor/programmable-token features are absent.
   * The secret is read from stdin (or $T2TOTP_SECRET), never from the command line.
-  * NFC/PC-SC keys are identified by reading their serial, not by reader name.";
+  * NFC/PC-SC keys are identified by reading their serial, not by reader name.
+  * OTP-PIN 'privacy protection' requires R3.4 firmware; on a protected key,
+    pass --pin to list/code so they can return codes. Device authenticity
+    (the P-521 agreement signature) is NOT verified by this client yet.";
 
 enum Error {
     Usage(String),
@@ -106,11 +116,20 @@ struct Globals {
     debug: bool,
     /// Explicit PC/SC reader name (serial-confirmed) — overrides auto-detect.
     reader: Option<String>,
+    /// When set, open + verify an OTP-PIN session before read commands so a
+    /// privacy-protected key returns codes. The value is read from
+    /// `$T2TOTP_PIN` / stdin, never argv — this flag is just a toggle.
+    verify_pin: bool,
+    /// True only if the user passed `--transport` explicitly. PIN operations
+    /// run over CCID/PC-SC on the key, so when the transport was left at its
+    /// default they force NFC rather than letting `auto` land on HID (whose
+    /// OTP applet answers PIN commands with 6A86 on these models).
+    iface_explicit: bool,
 }
 
 fn run(args: &[String]) -> Result<(), Error> {
-    let (globals, rest) = parse_globals(args)?;
-    let (cmd, cmd_args) = match rest.split_first() {
+    let (mut globals, rest) = parse_globals(args)?;
+    let (cmd, rest_args) = match rest.split_first() {
         Some(x) => x,
         None => {
             println!("{BANNER}\n");
@@ -118,6 +137,10 @@ fn run(args: &[String]) -> Result<(), Error> {
             return Ok(());
         }
     };
+    // Global flags are also accepted *after* the command, so
+    // `t2totp pin set --transport nfc` works as well as the leading form.
+    let cmd_args_owned = merge_trailing_globals(&mut globals, rest_args)?;
+    let cmd_args: &[String] = &cmd_args_owned;
 
     match cmd.as_str() {
         "help" | "--help" | "-h" => {
@@ -132,14 +155,17 @@ fn run(args: &[String]) -> Result<(), Error> {
         "add" => cmd_add(&globals, cmd_args),
         "delete" | "del" | "rm" => cmd_delete(&globals, cmd_args),
         "erase" => cmd_erase(&globals, cmd_args),
+        "pin" => cmd_pin(&globals, cmd_args),
         other => Err(Error::Usage(format!("unknown command: {other}"))),
     }
 }
 
 fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
     let mut iface = Interface::Auto;
+    let mut iface_explicit = false;
     let mut debug = false;
     let mut reader: Option<String> = None;
+    let mut verify_pin = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -157,6 +183,7 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
                         )))
                     }
                 };
+                iface_explicit = true;
                 i += 2;
             }
             "--reader" => {
@@ -170,6 +197,10 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
                 debug = true;
                 i += 1;
             }
+            "--pin" => {
+                verify_pin = true;
+                i += 1;
+            }
             _ => break,
         }
     }
@@ -178,9 +209,61 @@ fn parse_globals(args: &[String]) -> Result<(Globals, &[String]), Error> {
             iface,
             debug,
             reader,
+            verify_pin,
+            iface_explicit,
         },
         &args[i..],
     ))
+}
+
+/// Pull any global flags that appear *after* the subcommand out of `args`,
+/// applying them to `g`, and return the remaining (non-global) arguments. This
+/// lets `--transport`, `--reader`, `--pin`, and `--debug` be written in either
+/// position.
+fn merge_trailing_globals(g: &mut Globals, args: &[String]) -> Result<Vec<String>, Error> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--transport" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| Error::Usage("--transport needs a value".into()))?;
+                g.iface = match v.as_str() {
+                    "auto" => Interface::Auto,
+                    "hid" | "usb" => Interface::Hid,
+                    "nfc" | "ccid" | "pcsc" => Interface::Nfc,
+                    other => {
+                        return Err(Error::Usage(format!(
+                            "--transport must be auto|hid|nfc, got {other}"
+                        )))
+                    }
+                };
+                g.iface_explicit = true;
+                i += 2;
+            }
+            "--reader" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| Error::Usage("--reader needs a PC/SC reader name".into()))?;
+                g.reader = Some(v.clone());
+                i += 2;
+            }
+            "--pin" => {
+                g.verify_pin = true;
+                i += 1;
+            }
+            "--debug" => {
+                g.debug = true;
+                i += 1;
+            }
+            _ => {
+                out.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn now_secs() -> u64 {
@@ -191,11 +274,20 @@ fn now_secs() -> u64 {
 }
 
 fn open(g: &Globals) -> Result<OtpSession, Error> {
-    // An explicit reader name pins the NFC/PC-SC device (still serial-confirmed).
-    if let Some(name) = &g.reader {
-        return Ok(OtpSession::open_pcsc_reader(name, g.debug)?);
+    // When --pin is requested we need the CCID/PC-SC path (see open_for_pin);
+    // otherwise honour the requested/auto transport for ordinary read commands.
+    let mut s = if g.verify_pin {
+        open_for_pin(g)?
+    } else if let Some(name) = &g.reader {
+        OtpSession::open_pcsc_reader(name, g.debug)?
+    } else {
+        OtpSession::open(g.iface, g.debug)?
+    };
+    if g.verify_pin {
+        let pin = read_pin("OTP PIN")?;
+        s.verify_pin(&pin)?;
     }
-    Ok(OtpSession::open(g.iface, g.debug)?)
+    Ok(s)
 }
 
 // --- commands ---------------------------------------------------------------
@@ -387,7 +479,15 @@ fn cmd_add(g: &Globals, args: &[String]) -> Result<(), Error> {
     };
 
     let mut s = open(g)?;
-    s.write_entry(&we)?;
+    // On a PIN-protected key the write needs the PIN (opens the window and
+    // provides the agreement pubkey the seal reuses). If the user already passed
+    // --pin, open() verified it; otherwise prompt now when the key is protected.
+    let pin = if !g.verify_pin && s.pin_is_set().unwrap_or(false) {
+        Some(read_pin("OTP PIN")?)
+    } else {
+        None
+    };
+    s.write_entry_pinned(&we, pin.as_deref().map(|z| z.as_str()))?;
     println!(
         "added TOTP profile {}:{}{}",
         issuer,
@@ -400,7 +500,12 @@ fn cmd_add(g: &Globals, args: &[String]) -> Result<(), Error> {
 fn cmd_delete(g: &Globals, args: &[String]) -> Result<(), Error> {
     let (issuer, account) = two_args(args, "delete")?;
     let mut s = open(g)?;
-    s.delete_entry(issuer, account)?;
+    let pin = if !g.verify_pin && s.pin_is_set().unwrap_or(false) {
+        Some(read_pin("OTP PIN")?)
+    } else {
+        None
+    };
+    s.delete_entry_pinned(issuer, account, pin.as_deref().map(|z| z.as_str()))?;
     println!("deleted profile {issuer}:{account}");
     Ok(())
 }
@@ -422,7 +527,103 @@ fn cmd_erase(g: &Globals, args: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
+/// OTP-PIN management: `pin status|set|change|remove`.
+fn cmd_pin(g: &Globals, args: &[String]) -> Result<(), Error> {
+    let (sub, _rest) = args
+        .split_first()
+        .ok_or_else(|| Error::Usage("pin needs a subcommand: status|set|change|remove".into()))?;
+    match sub.as_str() {
+        "status" => {
+            let mut s = open_no_verify(g)?;
+            let flag = s.pin_status()?;
+            if flag.is_set() {
+                println!("OTP PIN: set");
+                println!("  length      : {} byte(s)", flag.pin_len);
+                println!("  retries left : {}", flag.retries_left);
+                println!("  max retries  : {}", flag.max_retries);
+            } else {
+                println!("OTP PIN: not set");
+            }
+            Ok(())
+        }
+        "set" => {
+            let mut s = open_no_verify(g)?;
+            let pin = read_pin("new OTP PIN")?;
+            let confirm = read_pin("confirm OTP PIN")?;
+            if pin.as_str() != confirm.as_str() {
+                return Err(Error::Other("PINs did not match".into()));
+            }
+            s.set_pin(&pin)?;
+            println!("OTP PIN set");
+            Ok(())
+        }
+        "change" => {
+            let mut s = open_no_verify(g)?;
+            let current = read_pin("current OTP PIN")?;
+            let new = read_pin("new OTP PIN")?;
+            let confirm = read_pin("confirm new OTP PIN")?;
+            if new.as_str() != confirm.as_str() {
+                return Err(Error::Other("new PINs did not match".into()));
+            }
+            s.change_pin(&current, &new)?;
+            println!("OTP PIN changed");
+            Ok(())
+        }
+        "remove" => {
+            let mut s = open_no_verify(g)?;
+            let current = read_pin("current OTP PIN")?;
+            s.remove_pin(&current)?;
+            println!("OTP PIN removed");
+            Ok(())
+        }
+        "lock" => {
+            let mut s = open_no_verify(g)?;
+            s.lock_pin()?;
+            println!("OTP PIN window locked");
+            Ok(())
+        }
+        other => Err(Error::Usage(format!(
+            "unknown pin subcommand: {other} (use status|set|change|remove|lock)"
+        ))),
+    }
+}
+
+/// Open a session WITHOUT auto-verifying a PIN — the pin subcommands drive the
+/// session themselves (and set/verify must not double-prompt).
+fn open_no_verify(g: &Globals) -> Result<OtpSession, Error> {
+    let s = open_for_pin(g)?;
+    Ok(s)
+}
+
+/// Open a session for OTP-PIN work. PIN commands run over the CCID/PC-SC
+/// interface on the key (the same path the GUI uses); the HID OTP applet
+/// answers them with `6A86` on these models. So unless the user explicitly
+/// chose a transport, force NFC/PC-SC here, and refuse to proceed on a HID
+/// session with an actionable message.
+fn open_for_pin(g: &Globals) -> Result<OtpSession, Error> {
+    if let Some(name) = &g.reader {
+        return Ok(OtpSession::open_pcsc_reader(name, g.debug)?);
+    }
+    let iface = if g.iface_explicit {
+        g.iface
+    } else {
+        // Default (unspecified) transport -> use NFC/PC-SC for PIN ops.
+        Interface::Nfc
+    };
+    let s = OtpSession::open(iface, g.debug)?;
+    if !s.is_pcsc() {
+        return Err(Error::Other(
+            "OTP-PIN commands must run over CCID/PC-SC (a contact or NFC reader), \
+             but the key was opened over USB-HID. Re-run with `--transport nfc` \
+             and the key on a PC/SC reader (this is the same interface the GUI uses)."
+                .into(),
+        ));
+    }
+    Ok(s)
+}
+
 // --- helpers ----------------------------------------------------------------
+
 
 fn yes_no(b: bool) -> &'static str {
     if b {
@@ -462,6 +663,43 @@ fn read_secret() -> Result<Zeroizing<String>, Error> {
     if trimmed.is_empty() {
         return Err(Error::Other(
             "no secret provided (pipe it on stdin or set $T2TOTP_SECRET)".into(),
+        ));
+    }
+    Ok(Zeroizing::new(trimmed))
+}
+
+/// Read an OTP PIN from `$T2TOTP_PIN` if set, else from the terminal with the
+/// input **masked** (no echo). Zeroizes on drop. `label` is the prompt shown.
+fn read_pin(label: &str) -> Result<Zeroizing<String>, Error> {
+    if let Some(val) = std::env::var_os("T2TOTP_PIN") {
+        let s = val
+            .into_string()
+            .map_err(|_| Error::Other("T2TOTP_PIN was not valid UTF-8".into()))?;
+        return Ok(Zeroizing::new(s.trim().to_string()));
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        // Masked prompt: nothing is echoed as the PIN is typed. Works on the
+        // Windows console as well as Unix ttys.
+        let entered = rpassword::prompt_password(format!("{label}: "))
+            .map_err(|e| Error::Other(format!("failed to read PIN: {e}")))?;
+        let mut entered = Zeroizing::new(entered);
+        let trimmed = entered.trim().to_string();
+        entered.zeroize();
+        if trimmed.is_empty() {
+            return Err(Error::Other("no PIN provided".into()));
+        }
+        return Ok(Zeroizing::new(trimmed));
+    }
+    // Non-interactive (piped): take the whole stdin as the PIN.
+    let mut buf = Zeroizing::new(String::new());
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| Error::Other(format!("failed to read PIN from stdin: {e}")))?;
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(Error::Other(
+            "no PIN provided (pipe it on stdin or set $T2TOTP_PIN)".into(),
         ));
     }
     Ok(Zeroizing::new(trimmed))
